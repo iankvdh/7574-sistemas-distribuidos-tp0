@@ -1,6 +1,10 @@
 SHELL := /bin/bash
 PWD := $(shell pwd)
 
+# Variable para el archivo de compose. 
+# Si no se pasa por línea de comandos, usa docker-compose-dev.yaml por defecto.
+FILE ?= docker-compose-dev.yaml
+
 GIT_REMOTE = github.com/7574-sistemas-distribuidos/docker-compose-init
 
 default: build
@@ -26,14 +30,14 @@ docker-image:
 .PHONY: docker-image
 
 docker-compose-up: docker-image
-	docker compose -f docker-compose-dev.yaml up -d --build
+	docker compose -f $(FILE) up -d --build
 .PHONY: docker-compose-up
 
 docker-compose-down:
-	docker compose -f docker-compose-dev.yaml stop -t 1
-	docker compose -f docker-compose-dev.yaml down
+	docker compose -f $(FILE) stop -t 1
+	docker compose -f $(FILE) down
 .PHONY: docker-compose-down
 
 docker-compose-logs:
-	docker compose -f docker-compose-dev.yaml logs -f
+	docker compose -f $(FILE) logs -f
 .PHONY: docker-compose-logs
