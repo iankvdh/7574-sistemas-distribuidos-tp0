@@ -1,45 +1,102 @@
 # TP0: Docker + Comunicaciones + Concurrencia
 
-## Parte 1: Introducción a Docker
-En esta primera parte del trabajo práctico se plantean una serie de ejercicios que sirven para introducir las herramientas básicas de Docker que se utilizarán a lo largo de la materia. El entendimiento de las mismas será crucial para el desarrollo de los próximos TPs.
+### Ejercicio N°2:
+Modificar el cliente y el servidor para lograr que realizar cambios en el archivo de configuración no requiera reconstruír las imágenes de Docker para que los mismos sean efectivos. La configuración a través del archivo correspondiente (`config.ini` y `config.yaml`, dependiendo de la aplicación) debe ser inyectada en el container y persistida por fuera de la imagen (hint: `docker volumes`).
 
-### Ejercicio N°1:
-Para mi solución aproveché la sugerencia de la consigna y creé el script `generar-compose.sh` que simplemente toma los argumentos ("Nombre del archivo de salida" y "Cantidad de clientes") y se los pasa a mi archivo python `mi-generador.py`. El mismo se encarga de generar un nuevo docker compose con el nombre pasado como argumento que respete el formato del `docker-compose-dev.yaml` pero genera tantos clientes como los pedidos.
 
-#### Para Ejecutarlo usar:
-Comenzamos dándole permisos al script:
+## Cambios implementados
+
+### Archivos modificados
+
+- **`docker-compose-dev.yaml` y `mi-generador.py`**
+
+    Los archivos `docker-compose-dev.yaml` y `mi-generador.py` ahora
+    incluyen:
+
+    ``` yaml
+    volumes:
+    - ./server/config.ini:/config.ini:ro
+    - ./client/config.yaml:/config.yaml:ro
+    ```
+
+    > **Nota:** El sufijo `:ro` significa "read-only" (solo lectura) desde el
+    contenedor.
+
+
+    Además se eliminaron las líneas `- LOGGING_LEVEL=DEBUG` y
+    `- CLI_LOG_LEVEL=DEBUG` para poder editar el LOG_LEVEL desde
+    configuración y que no los tome desde el compose.
+
+- **Dockerfile**
+
+    Por último se quitó la linea `COPY ./client/config.yaml /config.yaml`
+    del Dockerfile del cliente. Esto garantiza que la aplicación no utilice
+    una configuración "congelada" dentro de la imagen al momento del build,
+    obligando al contenedor a obtener la configuración en tiempo de
+    ejecución a través del volumen montado.
+
+## Cómo probar
+
+### Paso 1: Levantar el sistema
+
+``` bash
+make docker-compose-up FILE=docker-compose-dev.yaml
 ```
-chmod +x generar-compose.sh
+
+### Paso 2: Modificar configuración
+
+Edita `server/config.ini` o `client/config.yaml`. Cambia, por ejemplo,
+el log level o el puerto.
+
+### Paso 3: Reiniciar sin intervención de Makefile
+
+Para demostrar que la imagen no se toca, reinicia los contenedores
+directamente con Docker (ya que el Makefile hace build nuevamente):
+
+``` bash
+docker compose -f docker-compose-dev.yaml restart
 ```
 
+### Paso 4: Verificar los cambios
 
-Luego usamos el script:
-```
-./generar-compose.sh <archivo_de_salida> N
-
-# Ejemplo:
-./generar-compose.sh docker-compose-5-clientes.yaml 5
+``` bash
+docker compose -f docker-compose-dev.yaml logs -f
 ```
 
+Los logs mostrarán la nueva configuración aplicada sin haber
+reconstruido la imagen.
 
-Una vez generado el docker compose lo corremos al igual que el original con:
-```
-make docker-compose-up FILE=<archivo_de_salida>
+### Paso 5: Confirmación de "No Rebuild"
 
-# Ejemplo:
-make docker-compose-up FILE=docker-compose-5-clientes.yaml
-```
-Para ver sus logs correr:
-```
-make docker-compose-logs FILE=<archivo_de_salida>
+Si comparas el ID de la imagen antes y después, verás que no cambia:
 
-# Ejemplo:
-make docker-compose-logs FILE=docker-compose-5-clientes.yaml
-```
-Detenerlo:
-```
-make docker-compose-down FILE=<archivo_de_salida>
+``` bash
+# ID antes del cambio
+docker inspect server:latest --format='{{.ID}}'
 
-# Ejemplo:
-make docker-compose-down FILE=docker-compose-5-clientes.yaml
+# (Edita config, reinicia)
+
+# ID después del cambio
+docker inspect server:latest --format='{{.ID}}'
+
+# Las IDs deben ser iguales (la imagen no se reconstruyó)
+```
+
+## Con generador de compose
+
+### Uso con mi-generador.py
+
+Lo mismo aplica a compose generados con `mi-generador.py`:
+
+``` bash
+./generar-compose.sh docker-compose-test.yaml 5
+make docker-compose-up FILE=docker-compose-test.yaml
+
+# Editar configs...
+
+# Reiniciar sin rebuild
+docker compose -f docker-compose-test.yaml restart
+
+# Verificar
+docker compose -f docker-compose-test.yaml logs -f
 ```
