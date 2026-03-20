@@ -14,7 +14,7 @@ NETWORK="tp0_testing_net"
 # -w 2: timeout 2s
 RESULT=$(echo "$MSG" | docker run -i --rm --network "$NETWORK" busybox nc -w 2 "$SERVER_NAME" "$SERVER_PORT")
 
-if [ "$RESULT" == "$MSG" ]; then
+if [ "$RESULT" = "$MSG" ]; then
     echo "action: test_echo_server | result: success"
     exit 0
 else
