@@ -47,7 +47,7 @@ class Server:
                 logging.error(
                     f"action: shutdown | result: fail | error: Could not close client socket (unknown IP)"
                 )
-        logging.info("action: shutdown | result: success | server_socket_closed")
+        logging.info("action: shutdown | result: success | closed: server_socket")
 
     def __handle_client_connection(self, client_sock):
         """
