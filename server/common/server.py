@@ -34,10 +34,7 @@ class Server:
                 self.__handle_client_connection(client_sock)
                 self._clients.remove(client_sock)
             except OSError as e:
-                if self._running:
-                    logging.error(f"action: accept_connections | result: fail | error: {e}")
-                else:
-                    logging.info(f"action: accept_connections | result: interrupted | error: {e}")
+                logging.error(f"action: accept_connections | result: fail | error: {e}")
                 break
 
         for client in self._clients:
