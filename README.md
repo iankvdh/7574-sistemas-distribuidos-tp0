@@ -28,19 +28,19 @@ Modificar servidor y cliente para que ambos sistemas terminen de forma _graceful
 
 ### Paso 1: Levantamos el servidor y cliente
 ```bash
-make docker-compose-up
+make docker-compose-up FILE=docker-compose-dev.yaml
 ```
 
 ### Paso 2: Enviar señal `SIGTERM`
 ```bash
-docker-compose down -t 10
+docker compose -f docker-compose-dev.yaml down -t 10
 ```
 > El flag `-t 10` envía `SIGTERM` y espera hasta 10 segundos para terminar los containers
 
 
 ### Paso 3: Verificar los logs
 ```bash
-make docker-compos-logs
+make docker-compose-logs FILE=docker-compose-dev.yaml
 ```
 
 #### Servidor:
