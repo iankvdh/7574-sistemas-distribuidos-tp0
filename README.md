@@ -13,6 +13,16 @@ Modificar el servidor para que permita aceptar conexiones y procesar mensajes en
 - En este TP, el servidor es principalmente I/O-bound (sockets y acceso a archivo), por lo que _multithreading_ sigue siendo una opción válida y efectiva para escalar conexiones concurrentes.
 - Para evitar corrupción de datos en persistencia y condiciones de carrera en estado compartido, se agregaron locks explícitos.
 
+### Por qué multithreading y cuándo migrar a multiprocessing
+- Se eligió _multithreading_ porque el cuello de botella principal es I/O (espera de red y acceso a disco), no cálculo intensivo.
+- Este enfoque mantiene el diseño simple para el scope del ejercicio: un thread por conexión y sincronización con locks en recursos compartidos.
+- Debería migrarse a _multiprocessing_ si el servidor incorpora etapas CPU-bound relevantes (por ejemplo, validaciones complejas por apuesta, agregaciones pesadas o postprocesamiento intensivo de ganadores) y se observa que el uso de CPU queda limitado por el GIL.
+- Señales prácticas para migrar:
+  - CPU alta sostenida en un solo núcleo con baja mejora al aumentar threads.
+  - Mayor latencia en consultas bajo carga aunque la red no esté saturada.
+  - Contención creciente en locks por trabajo de cómputo dentro de secciones críticas.
+- Estrategia recomendada de migración: mantener sockets en el proceso principal y delegar tareas CPU-bound a un pool de procesos (worker pool), minimizando cambios en el protocolo de comunicación.
+
 
 
 ## Cambios implementados
