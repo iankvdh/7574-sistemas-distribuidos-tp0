@@ -1,18 +1,18 @@
 # TP0: Docker + Comunicaciones + Concurrencia
 
 
-### Ejercicio N°7:
+## Parte 3: Repaso de Concurrencia
+En este ejercicio es importante considerar los mecanismos de sincronización a utilizar para el correcto funcionamiento de la persistencia.
 
-Modificar los clientes para que notifiquen al servidor al finalizar con el envío de todas las apuestas y así proceder con el sorteo.
-Inmediatamente después de la notificacion, los clientes consultarán la lista de ganadores del sorteo correspondientes a su agencia.
-Una vez el cliente obtenga los resultados, deberá imprimir por log: `action: consulta_ganadores | result: success | cant_ganadores: ${CANT}`.
+### Ejercicio N°8:
 
-En esta implementación, el servidor recalcula los ganadores cuando recibe cada `END|agency` y habilita la respuesta de `QUERY|agency` para esa agencia.
-Antes de que una agencia notifique `END`, sus consultas reciben `ACK|WAIT` y no se responde con información parcial para esa agencia.
+Modificar el servidor para que permita aceptar conexiones y procesar mensajes en paralelo. En caso de que el alumno implemente el servidor en Python utilizando _multithreading_,  deberán tenerse en cuenta las [limitaciones propias del lenguaje](https://wiki.python.org/moin/GlobalInterpreterLock).
 
-Las funciones `load_bets(...)` y `has_won(...)` son provistas por la cátedra y no podrán ser modificadas por el alumno.
+### Consideraciones sobre GIL y diseño elegido
+- Python (CPython) usa GIL, por lo que los hilos no paralelizan bien trabajo puramente CPU-bound.
+- En este TP, el servidor es principalmente I/O-bound (sockets y acceso a archivo), por lo que _multithreading_ sigue siendo una opción válida y efectiva para escalar conexiones concurrentes.
+- Para evitar corrupción de datos en persistencia y condiciones de carrera en estado compartido, se agregaron locks explícitos.
 
-No es correcto realizar un broadcast de todos los ganadores hacia todas las agencias, se espera que se informen los DNIs ganadores que correspondan a cada una de ellas.
 
 
 ## Cambios implementados
@@ -44,6 +44,7 @@ No es correcto realizar un broadcast de todos los ganadores hacia todas las agen
 
 
 ### Servidor
+- Acepta conexiones en paralelo y crea un thread por cliente.
 - Recibe un mensaje batch por conexión.
 - Parsea el payload con `parse_batch_message(...)`.
 - Si todas las apuestas son válidas, persiste el lote con `store_bets(bets)` y responde `ACK|OK`.
@@ -54,6 +55,10 @@ No es correcto realizar un broadcast de todos los ganadores hacia todas las agen
 - Responde consultas de ganadores por agencia (`QUERY`):
   - Si la agencia aún no notificó `END`: `ACK|WAIT`
   - Si la agencia ya notificó `END`: `WINNERS|count|...`
+- Sincronización aplicada:
+  - `storage_lock`: serializa escritura/lectura de `STORAGE_FILEPATH`.
+  - `state_lock`: protege estructuras compartidas (`finished_agencies`, `winners_by_agency`).
+  - `clients_lock`: protege altas/bajas de sockets y lista de threads.
 - Logs principales:
   - `action: apuesta_recibida | result: success | cantidad: ${CANTIDAD_DE_APUESTAS}`
   - `action: apuesta_recibida | result: fail | cantidad: ${CANTIDAD_DE_APUESTAS}`
