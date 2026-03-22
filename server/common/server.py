@@ -2,9 +2,9 @@ import socket
 import logging
 import signal
 
-from common.bet_message import parse_bet_message
+from common.bet_message import BatchParseError, parse_batch_message
 from common.utils import store_bets
-from protocol.protocol import read_frame, write_frame, ACK_OK
+from protocol.protocol import read_frame, write_frame, ACK_OK, ACK_FAIL
 
 
 class Server:
@@ -26,7 +26,7 @@ class Server:
         Main server loop
 
         Accepts client connections sequentially. For each connection,
-        reads one framed bet message, stores it, sends an ACK, and then
+        reads one framed batch message, stores it, sends an ACK/NACK, and then
         continues waiting for the next client.
         """
         # Handle SIGTERM signal para cerrar el server gracefully
@@ -58,27 +58,44 @@ class Server:
         """
         Handles one client connection.
 
-        Receives one framed message, parses and stores the bet,
-        responds with ACK, and always closes the socket.
+        Receives one framed batch message, parses and stores the bets,
+        responds with ACK/NACK, and always closes the socket.
         """
         addr = ("unknown", 0)
+        batch_count = 0
         try:
             addr = client_sock.getpeername()
 
             msg = read_frame(client_sock).decode('utf-8')
             logging.info(f'action: receive_message | result: success | ip: {addr[0]}')
 
-            bet = parse_bet_message(msg)
-            store_bets([bet])
+            bets = parse_batch_message(msg)
+            batch_count = len(bets)
+            store_bets(bets)
             logging.info(
-                f"action: apuesta_almacenada | result: success | dni: {bet.document} | numero: {bet.number}"
+                f"action: apuesta_recibida | result: success | cantidad: {batch_count}"
             )
 
             write_frame(client_sock, ACK_OK)
         except OSError as e:
             logging.error(f"action: receive_message | result: fail | error: {e}")
-        except ValueError as e:
-            logging.error(f"action: receive_message | result: fail | ip: {addr[0]} | error: {e}")
+        except BatchParseError as e:
+            batch_count = e.count
+            logging.info(
+                f"action: apuesta_recibida | result: fail | cantidad: {batch_count}"
+            )
+            try:
+                write_frame(client_sock, ACK_FAIL)
+            except OSError:
+                pass
+        except ValueError:
+            logging.info(
+                f"action: apuesta_recibida | result: fail | cantidad: {batch_count}"
+            )
+            try:
+                write_frame(client_sock, ACK_FAIL)
+            except OSError:
+                pass
         finally:
             client_sock.close()
 

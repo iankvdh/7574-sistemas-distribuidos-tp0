@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/docker-compose-init/client/protocol"
@@ -15,23 +16,24 @@ var log = logging.MustGetLogger("log")
 
 // ClientConfig Configuration used by the client
 type ClientConfig struct {
-	ID            string
-	ServerAddress string
+	ID             string
+	ServerAddress  string
+	BatchMaxAmount int
 }
 
 // Client Entity that encapsulates how
 type Client struct {
 	config ClientConfig
 	conn   net.Conn
-	bet    Bet
+	bets   []Bet
 }
 
 // NewClient Initializes a new client receiving the configuration
 // as a parameter
-func NewClient(config ClientConfig, bet Bet) *Client {
+func NewClient(config ClientConfig, bets []Bet) *Client {
 	client := &Client{
 		config: config,
-		bet:    bet,
+		bets:   bets,
 	}
 	return client
 }
@@ -47,12 +49,66 @@ func (c *Client) createClientSocket() error {
 	return nil
 }
 
-func (c *Client) sendBet() error {
-	message := c.bet.buildBetMessage()
-	err := protocol.WriteFrame(c.conn, []byte(message))
+func (c *Client) sendBatch(bets []Bet) error {
+	message, err := BuildBatchMessage(bets)
 	if err != nil {
 		return err
 	}
+
+	err = protocol.WriteFrame(c.conn, []byte(message))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) sendBatches(stop <-chan struct{}) error {
+	for i := 0; i < len(c.bets); i += c.config.BatchMaxAmount {
+		select {
+		case <-stop:
+			return fmt.Errorf("client stopped")
+		default:
+		}
+
+		end := i + c.config.BatchMaxAmount
+		if end > len(c.bets) {
+			end = len(c.bets)
+		}
+
+		err := c.createClientSocket()
+		if err != nil {
+			return err
+		}
+
+		batch := c.bets[i:end]
+		err = c.sendBatch(batch)
+		if err != nil {
+			c.conn.Close()
+			return err
+		}
+
+		ackPayload, err := protocol.ReadFrame(c.conn)
+		c.conn.Close()
+		if err != nil {
+			return err
+		}
+
+		ack := string(ackPayload)
+		if ack == protocol.ExpectedNACK {
+			return fmt.Errorf("server returned fail ACK for batch size %d", len(batch))
+		}
+
+		if ack != protocol.ExpectedACK {
+			return fmt.Errorf("invalid ACK payload")
+		}
+
+		log.Infof(
+			"action: batch_enviado | result: success | cantidad: %s | client_id: %s",
+			strconv.Itoa(len(batch)),
+			c.config.ID,
+		)
+	}
+
 	return nil
 }
 
@@ -82,56 +138,15 @@ func (c *Client) StartClient() {
 	default:
 	}
 
-	// Create the connection the server in every loop iteration. Send an
-	err := c.createClientSocket()
-
-	if err != nil {
-		log.Criticalf(
-			"action: connect | result: fail | client_id: %v | error: %v",
-			c.config.ID,
-			err,
-		)
-		return // termina gracefull
-	}
-
-	// Enviar apuesta
-	err = c.sendBet()
+	err := c.sendBatches(stop)
 	if err != nil {
 		log.Errorf(
-			"action: send_bet | result: fail | client_id: %v | error: %v",
-			c.config.ID,
-			err,
-		)
-		c.conn.Close()
-		return
-	}
-
-	// Leer y validar ACK del servidor
-	ackPayload, err := protocol.ReadFrame(c.conn)
-	c.conn.Close()
-
-	if err != nil {
-		log.Errorf(
-			"action: receive_message | result: fail | client_id: %v | error: %v",
+			"action: send_batch | result: fail | client_id: %v | error: %v",
 			c.config.ID,
 			err,
 		)
 		return
 	}
 
-	if string(ackPayload) != protocol.ExpectedACK {
-		log.Errorf(
-			"action: receive_message | result: fail | client_id: %v | error: %v",
-			c.config.ID,
-			fmt.Errorf("invalid ACK payload"),
-		)
-		return
-	}
-
-	// log de enunciado:
-	log.Infof(
-		"action: apuesta_enviada | result: success | dni: %s | numero: %s",
-		c.bet.Document,
-		c.bet.Number,
-	)
+	log.Infof("action: batches_enviados | result: success | client_id: %v", c.config.ID)
 }

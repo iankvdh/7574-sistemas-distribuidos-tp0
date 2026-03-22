@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/op/go-logging"
@@ -33,13 +34,8 @@ func InitConfig() (*viper.Viper, error) {
 	v.BindEnv("id")
 	v.BindEnv("server", "address")
 	v.BindEnv("log", "level")
-
-	// Bet fields: keep internal keys in English, map from required env var names
-	v.BindEnv("first_name", "NOMBRE")
-	v.BindEnv("last_name", "APELLIDO")
-	v.BindEnv("document", "DOCUMENTO")
-	v.BindEnv("birthdate", "NACIMIENTO")
-	v.BindEnv("number", "NUMERO")
+	v.BindEnv("batch.maxAmount")
+	v.BindEnv("agency.file", "CLI_AGENCY_FILE")
 
 	// Try to read configuration from config file. If config file
 	// does not exists then ReadInConfig will fail but configuration
@@ -78,34 +74,22 @@ func InitLogger(logLevel string) error {
 // PrintConfig Print all the configuration parameters of the program.
 // For debugging purposes only
 func PrintConfig(v *viper.Viper) {
-	log.Infof("action: config | result: success | client_id: %s | server_address: %s | log_level: %s",
+	log.Infof("action: config | result: success | client_id: %s | server_address: %s | log_level: %s | batch_max_amount: %d | agency_file: %s",
 		v.GetString("id"),
 		v.GetString("server.address"),
 		v.GetString("log.level"),
+		v.GetInt("batch.maxAmount"),
+		v.GetString("agency.file"),
 	)
 }
 
-func PrintBetConfig(v *viper.Viper) {
-	log.Infof(
-		"action: bet_config | result: success | agency: %s | first_name: %s | last_name: %s | document: %s | birthdate: %s | number: %s",
-		v.GetString("id"),
-		v.GetString("first_name"),
-		v.GetString("last_name"),
-		v.GetString("document"),
-		v.GetString("birthdate"),
-		v.GetString("number"),
-	)
-}
-
-func BuildBet(v *viper.Viper) common.Bet {
-	return common.Bet{
-		Agency:    v.GetString("id"),
-		FirstName: v.GetString("first_name"),
-		LastName:  v.GetString("last_name"),
-		Document:  v.GetString("document"),
-		Birthdate: v.GetString("birthdate"),
-		Number:    v.GetString("number"),
+func resolveAgencyFile(v *viper.Viper) string {
+	agencyFile := v.GetString("agency.file")
+	if agencyFile != "" {
+		return agencyFile
 	}
+
+	return filepath.Join("/data", "agency-"+v.GetString("id")+".csv")
 }
 
 func main() {
@@ -122,15 +106,24 @@ func main() {
 	PrintConfig(v)
 
 	clientConfig := common.ClientConfig{
-		ServerAddress: v.GetString("server.address"),
-		ID:            v.GetString("id"),
+		ServerAddress:  v.GetString("server.address"),
+		ID:             v.GetString("id"),
+		BatchMaxAmount: v.GetInt("batch.maxAmount"),
+	}
+	if clientConfig.BatchMaxAmount <= 0 {
+		log.Criticalf("batch.maxAmount must be > 0")
+		return
 	}
 
-	// Constrimos la apuesta
-	bet := BuildBet(v)
-	PrintBetConfig(v)
+	agencyFile := resolveAgencyFile(v)
+	bets, err := common.LoadBetsFromCSV(agencyFile, clientConfig.ID)
+	if err != nil {
+		log.Criticalf("action: load_bets | result: fail | client_id: %s | error: %v", clientConfig.ID, err)
+		return
+	}
 
-	// Creamos un cliente con la bet
-	client := common.NewClient(clientConfig, bet)
+	log.Infof("action: load_bets | result: success | client_id: %s | cantidad: %d", clientConfig.ID, len(bets))
+
+	client := common.NewClient(clientConfig, bets)
 	client.StartClient()
 }

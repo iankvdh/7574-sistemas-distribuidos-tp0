@@ -6,7 +6,10 @@ import (
 	"io"
 )
 
-const ExpectedACK = "ACK|OK"
+const (
+	ExpectedACK  = "ACK|OK"
+	ExpectedNACK = "ACK|FAIL"
+)
 
 // WriteFrame escribe un frame en conexión con el formato:
 // 2 bytes size (uint16 big-endian)][payload]

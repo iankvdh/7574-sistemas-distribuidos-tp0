@@ -12,11 +12,11 @@ type Bet struct {
 	Number    string
 }
 
-// buildBetMessage serializa el contenido de la apuesta para su transporte.
-// Formato: BET|agencia|nombre|apellido|documento|nacimiento|numero
-func (b Bet) buildBetMessage() string {
+// ToRow serializa una apuesta en una fila para enviarla dentro de un batch.
+// Formato: agency|first_name|last_name|document|birthdate|number
+func (b Bet) ToRow() string {
 	return fmt.Sprintf(
-		"BET|%s|%s|%s|%s|%s|%s",
+		"%s|%s|%s|%s|%s|%s",
 		b.Agency,
 		b.FirstName,
 		b.LastName,

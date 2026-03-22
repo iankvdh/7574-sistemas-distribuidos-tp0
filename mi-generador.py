@@ -24,14 +24,10 @@ services:
     entrypoint: /client
     volumes:
       - ./client/config.yaml:/config.yaml:ro
+      - ./.data/dataset/agency-{cliente}.csv:/data/agency.csv:ro
     environment:
       - CLI_ID={cliente}
       - CLI_LOG_LEVEL=DEBUG
-      - NOMBRE=Santiago Lionel
-      - APELLIDO=Lorca
-      - DOCUMENTO=30904465
-      - NACIMIENTO=1999-03-17
-      - NUMERO=7574
     networks:
       - testing_net
     depends_on:

@@ -1,66 +1,51 @@
 # TP0: Docker + Comunicaciones + Concurrencia
 
 
-## Parte 2: Repaso de Comunicaciones
+### Ejercicio N°6:
+Modificar los clientes para que envíen varias apuestas a la vez (modalidad conocida como procesamiento por _chunks_ o _batchs_). 
+Los _batchs_ permiten que el cliente registre varias apuestas en una misma consulta, acortando tiempos de transmisión y procesamiento.
 
-Las secciones de repaso del trabajo práctico plantean un caso de uso denominado **Lotería Nacional**. Para la resolución de las mismas deberá utilizarse como base el código fuente provisto en la primera parte, con las modificaciones agregadas en el ejercicio 4.
+La información de cada agencia será simulada por la ingesta de su archivo numerado correspondiente, provisto por la cátedra dentro de `.data/datasets.zip`.
+Los archivos deberán ser inyectados en los containers correspondientes y persistido por fuera de la imagen (hint: `docker volumes`), manteniendo la convencion de que el cliente N utilizara el archivo de apuestas `.data/agency-{N}.csv` .
 
-### Ejercicio N°5:
-Modificar la lógica de negocio tanto de los clientes como del servidor para nuestro nuevo caso de uso.
+En el servidor, si todas las apuestas del *batch* fueron procesadas correctamente, imprimir por log: `action: apuesta_recibida | result: success | cantidad: ${CANTIDAD_DE_APUESTAS}`. En caso de detectar un error con alguna de las apuestas, debe responder con un código de error a elección e imprimir: `action: apuesta_recibida | result: fail | cantidad: ${CANTIDAD_DE_APUESTAS}`.
 
-#### Cliente
-Emulará a una _agencia de quiniela_ que participa del proyecto. Existen 5 agencias. Deberán recibir como variables de entorno los campos que representan la apuesta de una persona: nombre, apellido, DNI, nacimiento, numero apostado (en adelante 'número'). Ej.: `NOMBRE=Santiago Lionel`, `APELLIDO=Lorca`, `DOCUMENTO=30904465`, `NACIMIENTO=1999-03-17` y `NUMERO=7574` respectivamente.
+La cantidad máxima de apuestas dentro de cada _batch_ debe ser configurable desde config.yaml. Respetar la clave `batch: maxAmount`, pero modificar el valor por defecto de modo tal que los paquetes no excedan los 8kB. 
 
-Los campos deben enviarse al servidor para dejar registro de la apuesta. Al recibir la confirmación del servidor se debe imprimir por log: `action: apuesta_enviada | result: success | dni: ${DNI} | numero: ${NUMERO}`.
-
-
-
-#### Servidor
-Emulará a la _central de Lotería Nacional_. Deberá recibir los campos de la cada apuesta desde los clientes y almacenar la información mediante la función `store_bet(...)` para control futuro de ganadores. La función `store_bet(...)` es provista por la cátedra y no podrá ser modificada por el alumno.
-Al persistir se debe imprimir por log: `action: apuesta_almacenada | result: success | dni: ${DNI} | numero: ${NUMERO}`.
-
-#### Comunicación:
-Se deberá implementar un módulo de comunicación entre el cliente y el servidor donde se maneje el envío y la recepción de los paquetes, el cual se espera que contemple:
-* Definición de un protocolo para el envío de los mensajes.
-* Serialización de los datos.
-* Correcta separación de responsabilidades entre modelo de dominio y capa de comunicación.
-* Correcto empleo de sockets, incluyendo manejo de errores y evitando los fenómenos conocidos como [_short read y short write_](https://cs61.seas.harvard.edu/site/2018/FileDescriptors/).
+Por su parte, el servidor deberá responder con éxito solamente si todas las apuestas del _batch_ fueron procesadas correctamente.
 
 
 
 ## Cambios implementados
 
 ### Protocolo de comunicación
-- Se definió un frame binario de tamaño fijo para el header: `[2 bytes tamaño][payload]`.
-- El tamaño se codifica en big-endian (`uint16`) y luego se leen/escriben exactamente esos bytes.
-- Con este esquema se evitan `short read` y `short write` tanto en cliente como en servidor.
+- Se mantiene framing binario para transporte en sockets:
+  - `[2 bytes tamaño][payload]`.
+- El payload de negocio para batches se define como:
+  - `BATCH\n`
+  - `agency|first_name|last_name|document|birthdate|number\n` (una línea por apuesta).
+- Respuesta del servidor:
+  - `ACK|OK` si todo el batch fue persistido.
+  - `ACK|FAIL` si hubo error en alguna apuesta del batch.
 
-Formato de payload para apuestas:
-- `BET|agency|first_name|last_name|document|birthdate|number`
-
-Confirmación del servidor:
-- `ACK|OK` (también en frame binario)
 
 ### Cliente
-- Se agregó el modelo `Bet` en `client/common/bet.go` para separar dominio de comunicación.
-- `Bet` incluye `agency`, `first_name`, `last_name`, `document`, `birthdate` y `number`.
-- Las variables de entorno agregadas son:`NOMBRE`, `APELLIDO`, `DOCUMENTO`, `NACIMIENTO`, `NUMERO`.
-- El payload de la apuesta se arma en `buildBetMessage()` dentro del modelo.
-- El envío/recepción del frame usa `WriteFrame()` y `ReadFrame()` en `client/protocol/protocol.go`.
-- Al recibir `ACK`, el cliente loguea:
-  `action: apuesta_enviada | result: success | dni: ${DNI} | numero: ${NUMERO}`
+- El cliente ya no toma una apuesta individual desde env vars para el envío.
+- Carga apuestas desde el CSV de su agencia (`/data/agency.csv`) usando `LoadBetsFromCSV(...)`.
+- Divide la lista en lotes con tamaño máximo configurable por `batch.maxAmount`.
+- Envía cada lote como un único mensaje y espera ACK/NACK del servidor.
+- `batch.maxAmount` por defecto se ajustó a `80` para mantener paquetes por debajo de 8kB (empírico en base a los datasets dados).
+
 
 ### Servidor
-- Se implementó lectura/escritura de frame en `server/protocol/protocol.py` (`read_frame` / `write_frame`).
-- El parseo del mensaje de negocio `BET|agency|first_name|last_name|document|birthdate|number` se hace en `server/common/bet_message.py`.
-- Se persiste con `store_bets([bet])`.
-- Se envía respuesta `ACK|OK` en frame binario.
-- Al persistir se loguea:
-  `action: apuesta_almacenada | result: success | dni: ${DNI} | numero: ${NUMERO}`
+- Recibe un mensaje batch por conexión.
+- Parsea el payload con `parse_batch_message(...)`.
+- Si todas las apuestas son válidas, persiste el lote con `store_bets(bets)` y responde `ACK|OK`.
+- Si alguna apuesta falla, responde `ACK|FAIL`.
+- Logs del enunciado para ejercicio 6:
+  - `action: apuesta_recibida | result: success | cantidad: ${CANTIDAD_DE_APUESTAS}`
+  - `action: apuesta_recibida | result: fail | cantidad: ${CANTIDAD_DE_APUESTAS}`
 
-### De dónde sale el número de agencia
-- En `mi-generador.py`, cada cliente se crea con una variable `CLI_ID` distinta (`1..N`).
-- Ese valor se toma en el cliente como `id` y se usa como `agency` dentro de la apuesta.
 
 ## Cómo probar
 
@@ -71,6 +56,10 @@ chmod +x generar-compose.sh
 make docker-compose-up FILE=docker-compose-5.yaml
 ```
 
+> El compose generado monta automáticamente:
+> - `./.data/dataset/agency-{N}.csv` en cada cliente N
+> - como `/data/agency.csv` dentro del contenedor
+
 ### Paso 2: Ver los logs en tiempo real
 ```bash
 make docker-compose-logs FILE=docker-compose-5.yaml
@@ -78,10 +67,10 @@ make docker-compose-logs FILE=docker-compose-5.yaml
 > Verificar al menos:
 
 Servidor:
-  action: apuesta_almacenada | result: success | dni: <DNI> | numero: <NUMERO>
+  action: apuesta_recibida | result: success | cantidad: <N>
 
 Cliente:
-  action: apuesta_enviada | result: success | dni: <DNI> | numero: <NUMERO>
+  action: batch_enviado | result: success | cantidad: <N> | client_id: <ID>
 
 ### Paso 3: Detener containers
 ```bash
