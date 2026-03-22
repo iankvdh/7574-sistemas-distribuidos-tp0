@@ -86,9 +86,7 @@ func PrintConfig(v *viper.Viper) {
 func resolveAgencyFile(v *viper.Viper) string {
 	agencyFile := v.GetString("agency.file")
 	if agencyFile != "" {
-		if _, err := os.Stat(agencyFile); err == nil {
-			return agencyFile
-		}
+		return agencyFile
 	}
 
 	return filepath.Join("/data", "agency-"+v.GetString("id")+".csv")
