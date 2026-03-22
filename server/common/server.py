@@ -66,7 +66,7 @@ class Server:
             addr = client_sock.getpeername()
 
             msg = read_frame(client_sock).decode('utf-8')
-            logging.info(f'action: receive_message | result: success | ip: {addr[0]} | msg: {msg}')
+            logging.info(f'action: receive_message | result: success | ip: {addr[0]}')
 
             bet = parse_bet_message(msg)
             store_bets([bet])

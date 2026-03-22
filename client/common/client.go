@@ -123,7 +123,7 @@ func (c *Client) StartClient() {
 		log.Errorf(
 			"action: receive_message | result: fail | client_id: %v | error: %v",
 			c.config.ID,
-			fmt.Errorf("invalid ACK payload: %q", string(ackPayload)),
+			fmt.Errorf("invalid ACK payload"),
 		)
 		return
 	}
