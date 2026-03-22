@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	ExpectedACK  = "ACK|OK"
-	ExpectedNACK = "ACK|FAIL"
+	ExpectedACK     = "ACK|OK"
+	ExpectedNACK    = "ACK|FAIL"
+	ExpectedACKWait = "ACK|WAIT"
 )
 
 // WriteFrame escribe un frame en conexión con el formato:

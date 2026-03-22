@@ -2,6 +2,12 @@ package common
 
 import "fmt"
 
+const (
+	QueryMsgType   = "QUERY"
+	EndMsgType     = "END"
+	WinnersMsgType = "WINNERS"
+)
+
 // Bet representa una apuesta de lotería enviada por una agencia.
 type Bet struct {
 	Agency    string

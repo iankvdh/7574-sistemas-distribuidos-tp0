@@ -1,5 +1,6 @@
 ACK_OK = b"ACK|OK"
 ACK_FAIL = b"ACK|FAIL"
+ACK_WAIT = b"ACK|WAIT"
 
 # read_exact lee exactamente 'size' bytes del socket.
 # Si la conexión se cierra antes de completar la lectura, tira un error.

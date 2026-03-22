@@ -1,6 +1,9 @@
 from common.utils import Bet
 
 BATCH_MSG_TYPE = "BATCH"
+QUERY_MSG_TYPE = "QUERY"
+END_MSG_TYPE = "END"
+WINNERS_MSG_TYPE = "WINNERS"
 
 
 class BatchParseError(ValueError):
@@ -39,3 +42,23 @@ def parse_batch_message(message):
         raise BatchParseError(str(exc), count)
 
     return bets
+
+
+def parse_end_message(message):
+    parts = message.split("|")
+    if len(parts) != 2:
+        raise ValueError("invalid END format")
+    msg_type, agency = parts
+    if msg_type != END_MSG_TYPE:
+        raise ValueError("unsupported message type")
+    return agency
+
+
+def parse_query_message(message):
+    parts = message.split("|")
+    if len(parts) != 2:
+        raise ValueError("invalid QUERY format")
+    msg_type, agency = parts
+    if msg_type != QUERY_MSG_TYPE:
+        raise ValueError("unsupported message type")
+    return agency

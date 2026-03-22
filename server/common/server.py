@@ -2,9 +2,9 @@ import socket
 import logging
 import signal
 
-from common.bet_message import BatchParseError, parse_batch_message
-from common.utils import store_bets
-from protocol.protocol import read_frame, write_frame, ACK_OK, ACK_FAIL
+from common.bet_message import BatchParseError, parse_batch_message, parse_end_message, parse_query_message, BATCH_MSG_TYPE, END_MSG_TYPE, QUERY_MSG_TYPE, WINNERS_MSG_TYPE
+from common.utils import has_won, load_bets, store_bets
+from protocol.protocol import read_frame, write_frame, ACK_OK, ACK_FAIL, ACK_WAIT
 
 
 class Server:
@@ -15,6 +15,9 @@ class Server:
         self._server_socket.listen(listen_backlog)
         self._running = True
         self._clients = []
+        self._finished_agencies = set()
+        self._bets_over = False
+        self._winners_by_agency = {}
 
     def _handle_sigterm(self, signum, frame):
         logging.info("action: shutdown | result: in_progress | signal: SIGTERM")
@@ -58,8 +61,13 @@ class Server:
         """
         Handles one client connection.
 
-        Receives one framed batch message, parses and stores the bets,
-        responds with ACK/NACK, and always closes the socket.
+        Receives a single framed message and processes it according to its type:
+
+        - "BATCH": parses and stores a batch of bets, responds with ACK/NACK.
+        - "END": marks an agency as finished; when all agencies are done,
+        triggers the draw and computes winners.
+        - "QUERY": returns winners for a given agency if the draw is complete,
+        otherwise responds with WAIT.
         """
         addr = ("unknown", 0)
         batch_count = 0
@@ -69,14 +77,41 @@ class Server:
             msg = read_frame(client_sock).decode('utf-8')
             logging.info(f'action: receive_message | result: success | ip: {addr[0]}')
 
-            bets = parse_batch_message(msg)
-            batch_count = len(bets)
-            store_bets(bets)
-            logging.info(
-                f"action: apuesta_recibida | result: success | cantidad: {batch_count}"
-            )
+            if msg.startswith(BATCH_MSG_TYPE+"\n"):
+                bets = parse_batch_message(msg)
+                batch_count = len(bets)
+                store_bets(bets)
+                logging.info(
+                    f"action: apuesta_recibida | result: success | cantidad: {batch_count}"
+                )
+                write_frame(client_sock, ACK_OK)
+                return
 
-            write_frame(client_sock, ACK_OK)
+            if msg.startswith(END_MSG_TYPE+"|"):
+                agency = parse_end_message(msg)
+                self._finished_agencies.add(agency)
+                if len(self._finished_agencies) == 5 and not self._bets_over:
+                    self.__run_winners_by_agency()
+                    logging.info("action: sorteo | result: success")
+                write_frame(client_sock, ACK_OK)
+                return
+
+            if msg.startswith(QUERY_MSG_TYPE+"|"):
+                agency = parse_query_message(msg)
+                if not self._bets_over:
+                    write_frame(client_sock, ACK_WAIT)
+                    return
+
+                winners = self._winners_by_agency.get(agency, [])
+                winners_payload = "{}|{}|{}".format(
+                    WINNERS_MSG_TYPE,
+                    len(winners),
+                    ",".join(winners),
+                )
+                write_frame(client_sock, winners_payload.encode("utf-8"))
+                return
+
+            raise ValueError("unsupported message payload")
         except OSError as e:
             logging.error(f"action: receive_message | result: fail | error: {e}")
         except BatchParseError as e:
@@ -113,3 +148,22 @@ class Server:
         logging.info(f'action: accept_connections | result: success | ip: {addr[0]}')
         self._clients.append(c)
         return c
+
+    def __run_winners_by_agency(self):
+        """
+        Computes winners grouped by agency.
+
+        Marks the betting phase as finished, loads all stored bets,
+        evaluates which bets have won, and builds an in-memory mapping:
+
+            agency -> list of winner document IDs
+        """
+
+        self._bets_over = True
+        bets = list(load_bets())
+        for bet in bets:
+            if has_won(bet):
+                agency = str(bet.agency)
+                if agency not in self._winners_by_agency:
+                    self._winners_by_agency[agency] = []
+                self._winners_by_agency[agency].append(str(bet.document))

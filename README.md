@@ -1,19 +1,18 @@
 # TP0: Docker + Comunicaciones + Concurrencia
 
 
-### Ejercicio N°6:
-Modificar los clientes para que envíen varias apuestas a la vez (modalidad conocida como procesamiento por _chunks_ o _batchs_). 
-Los _batchs_ permiten que el cliente registre varias apuestas en una misma consulta, acortando tiempos de transmisión y procesamiento.
+### Ejercicio N°7:
 
-La información de cada agencia será simulada por la ingesta de su archivo numerado correspondiente, provisto por la cátedra dentro de `.data/datasets.zip`.
-Los archivos deberán ser inyectados en los containers correspondientes y persistido por fuera de la imagen (hint: `docker volumes`), manteniendo la convencion de que el cliente N utilizara el archivo de apuestas `.data/agency-{N}.csv` .
+Modificar los clientes para que notifiquen al servidor al finalizar con el envío de todas las apuestas y así proceder con el sorteo.
+Inmediatamente después de la notificacion, los clientes consultarán la lista de ganadores del sorteo correspondientes a su agencia.
+Una vez el cliente obtenga los resultados, deberá imprimir por log: `action: consulta_ganadores | result: success | cant_ganadores: ${CANT}`.
 
-En el servidor, si todas las apuestas del *batch* fueron procesadas correctamente, imprimir por log: `action: apuesta_recibida | result: success | cantidad: ${CANTIDAD_DE_APUESTAS}`. En caso de detectar un error con alguna de las apuestas, debe responder con un código de error a elección e imprimir: `action: apuesta_recibida | result: fail | cantidad: ${CANTIDAD_DE_APUESTAS}`.
+El servidor deberá esperar la notificación de las 5 agencias para considerar que se realizó el sorteo e imprimir por log: `action: sorteo | result: success`.
+Luego de este evento, podrá verificar cada apuesta con las funciones `load_bets(...)` y `has_won(...)` y retornar los DNI de los ganadores de la agencia en cuestión. Antes del sorteo no se podrán responder consultas por la lista de ganadores con información parcial.
 
-La cantidad máxima de apuestas dentro de cada _batch_ debe ser configurable desde config.yaml. Respetar la clave `batch: maxAmount`, pero modificar el valor por defecto de modo tal que los paquetes no excedan los 8kB. 
+Las funciones `load_bets(...)` y `has_won(...)` son provistas por la cátedra y no podrán ser modificadas por el alumno.
 
-Por su parte, el servidor deberá responder con éxito solamente si todas las apuestas del _batch_ fueron procesadas correctamente.
-
+No es correcto realizar un broadcast de todos los ganadores hacia todas las agencias, se espera que se informen los DNIs ganadores que correspondan a cada una de ellas.
 
 
 ## Cambios implementados
@@ -21,20 +20,27 @@ Por su parte, el servidor deberá responder con éxito solamente si todas las ap
 ### Protocolo de comunicación
 - Se mantiene framing binario para transporte en sockets:
   - `[2 bytes tamaño][payload]`.
-- El payload de negocio para batches se define como:
+- El payload de negocio para apuestas por lote se define como:
   - `BATCH\n`
   - `agency|first_name|last_name|document|birthdate|number\n` (una línea por apuesta).
-- Respuesta del servidor:
+- Mensajes de control agregados para ejercicio 7:
+  - `END|agency` (notificación de fin de envíos)
+  - `QUERY|agency` (consulta de ganadores de la agencia)
+- Respuestas del servidor:
   - `ACK|OK` si todo el batch fue persistido.
   - `ACK|FAIL` si hubo error en alguna apuesta del batch.
+  - `ACK|WAIT` si llega una consulta antes de que se complete el sorteo.
+  - `WINNERS|count|dni1,dni2,...` para responder ganadores por agencia.
 
 
 ### Cliente
-- El cliente ya no toma una apuesta individual desde env vars para el envío.
 - Carga apuestas desde el CSV de su agencia (`/data/agency.csv`) usando `LoadBetsFromCSV(...)`.
 - Divide la lista en lotes con tamaño máximo configurable por `batch.maxAmount`.
 - Envía cada lote como un único mensaje y espera ACK/NACK del servidor.
-- `batch.maxAmount` por defecto se ajustó a `80` para mantener paquetes por debajo de 8kB (empírico en base a los datasets dados).
+- Al terminar de enviar todos los lotes, envía `END|agency` al servidor.
+- Luego realiza `QUERY|agency` hasta recibir una respuesta de ganadores.
+- Cuando obtiene la respuesta final, loguea:
+  - `action: consulta_ganadores | result: success | cant_ganadores: ${CANT}`
 
 
 ### Servidor
@@ -42,9 +48,16 @@ Por su parte, el servidor deberá responder con éxito solamente si todas las ap
 - Parsea el payload con `parse_batch_message(...)`.
 - Si todas las apuestas son válidas, persiste el lote con `store_bets(bets)` y responde `ACK|OK`.
 - Si alguna apuesta falla, responde `ACK|FAIL`.
-- Logs del enunciado para ejercicio 6:
+- Mantiene el estado de agencias que notificaron fin de envío (`END`).
+- Cuando se completan las 5 agencias, ejecuta el sorteo y loguea:
+  - `action: sorteo | result: success`
+- Responde consultas de ganadores por agencia (`QUERY`):
+  - Antes del sorteo: `ACK|WAIT`
+  - Después del sorteo: `WINNERS|count|...`
+- Logs principales:
   - `action: apuesta_recibida | result: success | cantidad: ${CANTIDAD_DE_APUESTAS}`
   - `action: apuesta_recibida | result: fail | cantidad: ${CANTIDAD_DE_APUESTAS}`
+  - `action: sorteo | result: success`
 
 
 ## Cómo probar
@@ -64,13 +77,11 @@ make docker-compose-up FILE=docker-compose-5.yaml
 ```bash
 make docker-compose-logs FILE=docker-compose-5.yaml
 ```
-> Verificar al menos:
+> Verificar:
 
-Servidor:
-  action: apuesta_recibida | result: success | cantidad: <N>
++ **Servidor**: `action: sorteo | result: success`
 
-Cliente:
-  action: batch_enviado | result: success | cantidad: <N> | client_id: <ID>
++ **Cliente**: `action: consulta_ganadores | result: success | cant_ganadores: <CANT>`
 
 ### Paso 3: Detener containers
 ```bash

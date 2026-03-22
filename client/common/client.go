@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/7574-sistemas-distribuidos/docker-compose-init/client/protocol"
 	"github.com/op/go-logging"
@@ -60,6 +62,74 @@ func (c *Client) sendBatch(bets []Bet) error {
 		return err
 	}
 	return nil
+}
+
+func (c *Client) sendControlMessage(message string) (string, error) {
+	err := c.createClientSocket()
+	if err != nil {
+		return "", err
+	}
+
+	err = protocol.WriteFrame(c.conn, []byte(message))
+	if err != nil {
+		c.conn.Close()
+		return "", err
+	}
+
+	payload, err := protocol.ReadFrame(c.conn)
+	c.conn.Close()
+	if err != nil {
+		return "", err
+	}
+
+	return string(payload), nil
+}
+
+func (c *Client) notifyFinished() error {
+	resp, err := c.sendControlMessage(EndMsgType + "|" + c.config.ID)
+	if err != nil {
+		return err
+	}
+	if resp != protocol.ExpectedACK {
+		return fmt.Errorf("invalid END response")
+	}
+	return nil
+}
+
+func (c *Client) queryWinners(stop <-chan struct{}) (int, error) {
+	for {
+		select {
+		case <-stop:
+			return 0, fmt.Errorf("client stopped")
+		default:
+		}
+
+		resp, err := c.sendControlMessage(QueryMsgType + "|" + c.config.ID)
+		if err != nil {
+			return 0, err
+		}
+
+		if resp == protocol.ExpectedACKWait {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		if !strings.HasPrefix(resp, WinnersMsgType+"|") {
+			return 0, fmt.Errorf("invalid QUERY response")
+		}
+
+		parts := strings.SplitN(resp, "|", 3)
+		if len(parts) < 2 {
+			return 0, fmt.Errorf("invalid winners payload")
+		}
+
+		count, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return 0, err
+		}
+
+		return count, nil
+	}
 }
 
 func (c *Client) sendBatches(stop <-chan struct{}) error {
@@ -149,4 +219,26 @@ func (c *Client) StartClient() {
 	}
 
 	log.Infof("action: batches_enviados | result: success | client_id: %v", c.config.ID)
+
+	err = c.notifyFinished()
+	if err != nil {
+		log.Errorf(
+			"action: fin_envio | result: fail | client_id: %v | error: %v",
+			c.config.ID,
+			err,
+		)
+		return
+	}
+
+	count, err := c.queryWinners(stop)
+	if err != nil {
+		log.Errorf(
+			"action: consulta_ganadores | result: fail | client_id: %v | error: %v",
+			c.config.ID,
+			err,
+		)
+		return
+	}
+
+	log.Infof("action: consulta_ganadores | result: success | cant_ganadores: %d", count)
 }
