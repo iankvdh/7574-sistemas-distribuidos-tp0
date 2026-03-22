@@ -16,6 +16,7 @@ class Server:
         self._running = True
         self._clients = []
         self._finished_agencies = set()
+        self._known_agencies = set()
         self._bets_over = False
         self._winners_by_agency = {}
 
@@ -80,6 +81,8 @@ class Server:
             if msg.startswith(BATCH_MSG_TYPE+"\n"):
                 bets = parse_batch_message(msg)
                 batch_count = len(bets)
+                if batch_count > 0:
+                    self._known_agencies.add(str(bets[0].agency))
                 store_bets(bets)
                 logging.info(
                     f"action: apuesta_recibida | result: success | cantidad: {batch_count}"
@@ -89,8 +92,13 @@ class Server:
 
             if msg.startswith(END_MSG_TYPE+"|"):
                 agency = parse_end_message(msg)
+                self._known_agencies.add(agency)
                 self._finished_agencies.add(agency)
-                if len(self._finished_agencies) == 5 and not self._bets_over:
+                if (
+                    not self._bets_over
+                    and len(self._known_agencies) > 0
+                    and self._finished_agencies.issuperset(self._known_agencies)
+                ):
                     self.__run_winners_by_agency()
                     logging.info("action: sorteo | result: success")
                 write_frame(client_sock, ACK_OK)
