@@ -7,8 +7,8 @@ Modificar los clientes para que notifiquen al servidor al finalizar con el enví
 Inmediatamente después de la notificacion, los clientes consultarán la lista de ganadores del sorteo correspondientes a su agencia.
 Una vez el cliente obtenga los resultados, deberá imprimir por log: `action: consulta_ganadores | result: success | cant_ganadores: ${CANT}`.
 
-El servidor deberá esperar la notificación de las 5 agencias para considerar que se realizó el sorteo e imprimir por log: `action: sorteo | result: success`.
-Luego de este evento, podrá verificar cada apuesta con las funciones `load_bets(...)` y `has_won(...)` y retornar los DNI de los ganadores de la agencia en cuestión. Antes del sorteo no se podrán responder consultas por la lista de ganadores con información parcial.
+En esta implementación, el servidor recalcula los ganadores cuando recibe cada `END|agency` y habilita la respuesta de `QUERY|agency` para esa agencia.
+Antes de que una agencia notifique `END`, sus consultas reciben `ACK|WAIT` y no se responde con información parcial para esa agencia.
 
 Las funciones `load_bets(...)` y `has_won(...)` son provistas por la cátedra y no podrán ser modificadas por el alumno.
 
@@ -34,7 +34,7 @@ No es correcto realizar un broadcast de todos los ganadores hacia todas las agen
 
 
 ### Cliente
-- Carga apuestas desde el CSV de su agencia (`/data/agency.csv`) usando `LoadBetsFromCSV(...)`.
+- Carga apuestas desde el CSV de su agencia (`/data/agency-{ID}.csv`) usando `LoadBetsFromCSV(...)`.
 - Divide la lista en lotes con tamaño máximo configurable por `batch.maxAmount`.
 - Envía cada lote como un único mensaje y espera ACK/NACK del servidor.
 - Al terminar de enviar todos los lotes, envía `END|agency` al servidor.
@@ -49,11 +49,11 @@ No es correcto realizar un broadcast de todos los ganadores hacia todas las agen
 - Si todas las apuestas son válidas, persiste el lote con `store_bets(bets)` y responde `ACK|OK`.
 - Si alguna apuesta falla, responde `ACK|FAIL`.
 - Mantiene el estado de agencias que notificaron fin de envío (`END`).
-- Cuando se completan las 5 agencias, ejecuta el sorteo y loguea:
+- Cuando llega `END` de una agencia, recalcula ganadores y loguea:
   - `action: sorteo | result: success`
 - Responde consultas de ganadores por agencia (`QUERY`):
-  - Antes del sorteo: `ACK|WAIT`
-  - Después del sorteo: `WINNERS|count|...`
+  - Si la agencia aún no notificó `END`: `ACK|WAIT`
+  - Si la agencia ya notificó `END`: `WINNERS|count|...`
 - Logs principales:
   - `action: apuesta_recibida | result: success | cantidad: ${CANTIDAD_DE_APUESTAS}`
   - `action: apuesta_recibida | result: fail | cantidad: ${CANTIDAD_DE_APUESTAS}`
@@ -70,8 +70,8 @@ make docker-compose-up FILE=docker-compose-5.yaml
 ```
 
 > El compose generado monta automáticamente:
-> - `./.data/dataset/agency-{N}.csv` en cada cliente N
-> - como `/data/agency.csv` dentro del contenedor
+> - `./.data/agency-{N}.csv` en cada cliente N
+> - como `/data/agency-{N}.csv` dentro del contenedor
 
 ### Paso 2: Ver los logs en tiempo real
 ```bash
