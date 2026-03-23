@@ -1,3 +1,17 @@
+## Autores
+
+| Nombre         | Apellido      | Mail                  | Padrón |
+| -------------- | ------------- | --------------------- | ------ |
+| Ian            | von der Heyde | ivon@fi.uba.ar        | 107638 |
+
+## Estructura del Proyecto
+
+El desarrollo de este Trabajo Práctico se realizó de forma **iterativa y modular**, cumpliendo con la consigna de mantener una rama independiente por cada ejercicio.
+
+Cada rama contiene su propia documentación específica en el `README.md` detallando los cambios correspondientes a ese nivel.
+
+> Nota para la corrección: Para evaluar el sistema en su estado final y más robusto, se recomienda posicionarse en la rama `ej8`.
+
 # TP0: Docker + Comunicaciones + Concurrencia
 
 En el presente repositorio se provee un esqueleto básico de cliente/servidor, en donde todas las dependencias del mismo se encuentran encapsuladas en containers. Los alumnos deberán resolver una guía de ejercicios incrementales, teniendo en cuenta las condiciones de entrega descritas al final de este enunciado.
