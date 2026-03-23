@@ -1,27 +1,37 @@
+import os
 import socket
 import logging
 import signal
-from threading import Lock, Thread
+import hashlib
+from multiprocessing import Lock, Manager, Process, Semaphore
 
 from common.bet_message import BatchParseError, parse_batch_message, parse_end_message, parse_query_message, BATCH_MSG_TYPE, END_MSG_TYPE, QUERY_MSG_TYPE, WINNERS_MSG_TYPE
-from common.utils import has_won, load_bets, store_bets
+from common.utils import has_won, store_bets
 from protocol.protocol import read_frame, write_frame, ACK_OK, ACK_FAIL, ACK_WAIT
+
+WINNERS_DIRPATH = "./winners"
 
 
 class Server:
-    def __init__(self, port, listen_backlog):
+    def __init__(self, port, listen_backlog, max_workers=None):
         # Initialize server socket
         self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_socket.bind(('', port))
         self._server_socket.listen(listen_backlog)
         self._running = True
-        self._clients = []
-        self._client_threads = []
-        self._clients_lock = Lock()      # protege altas/bajas de sockets y lista de threads.
-        self._state_lock = Lock()        # protege estructuras compartidas: finished_agencies, winners_by_agency.
-        self._storage_lock = Lock()      # serializa escritura/lectura de STORAGE_FILEPATH.
-        self._finished_agencies = set()
-        self._winners_by_agency = {}
+        self._max_workers = max_workers if max_workers is not None else listen_backlog
+        if self._max_workers <= 0:
+            raise ValueError("max_workers must be > 0")
+        self._worker_slots = Semaphore(self._max_workers)   # Limita la cantidad de procesos que pueden trabajar al mismo tiempo. Las conexiones extra quedan esperando en el TCP backlog.
+        self._worker_processes = []  # Almacena las referencias a procesos hijos activos.
+        self._worker_processes_lock = Lock()   # Sincroniza el acceso a la lista de procesos.
+        self._finished_agencies_lock = Lock()  # incroniza el acceso a la lista de agencias finalizadas.
+        self._bets_file_lock = Lock()  # Acceso exclusivo de escritura para STORAGE_FILEPATH.
+        self._winners_file_locks = [Lock() for _ in range(16)] # Locks segmentados para reducir contencion entre agencias distintas.
+        self._manager = Manager()        # para compartir objetos entre procesos separados.
+        self._finished_agencies = self._manager.dict() # Diccionario compartido
+
+        self.__initialize_winners_storage()
 
     def _handle_sigterm(self, signum, frame):
         logging.info("action: shutdown | result: in_progress | signal: SIGTERM")
@@ -30,9 +40,9 @@ class Server:
 
     def run(self):
         """
-        Main server loop
+        Main server loop.
 
-        Accepts client connections and dispatches one worker thread per
+        Accepts client connections and dispatches one worker process per
         connection, allowing concurrent request handling.
         """
         # Handle SIGTERM signal para cerrar el server gracefully
@@ -40,38 +50,42 @@ class Server:
 
         while self._running:
             try:
+                worker_started = False
+                self._worker_slots.acquire() # Se bloquea cuando se alcanza el máximo de procesos activos.
                 client_sock = self.__accept_new_connection()
-                client_thread = Thread(
+                worker = Process( # Crea un proceso hijo independiente para manejar al cliente.
                     target=self.__handle_client_connection,
                     args=(client_sock,),
-                    daemon=True, # si el servidor principal muere, los hilos se cierran automáticamente.
+                    daemon=True, # El hijo muere si el padre muere.
                 )
-                with self._clients_lock:
-                    self._client_threads.append(client_thread)
-                client_thread.start()
+                with self._worker_processes_lock:
+                    self._worker_processes.append(worker)
+                worker.start()
+                worker_started = True
+
+                client_sock.close() # El padre cierra su copia del socket; solo el hijo lo usa.
+                self.__reap_finished_workers()
             except OSError as e:
+                if not worker_started:
+                    self._worker_slots.release()
                 if self._running:
                     logging.error(f"action: accept_connections | result: fail | error: {e}")
                 break
-
-        with self._clients_lock:
-            clients = list(self._clients)
-            threads = list(self._client_threads)
-
-        for client in clients:
-            try:
-                client.close()
-                logging.info(
-                    f"action: shutdown | result: success | closed_client_ip: {client.getpeername()[0]}"
-                )
             except Exception:
-                logging.error(
-                    f"action: shutdown | result: fail | error: Could not close client socket (unknown IP)"
-                )
+                if not worker_started:
+                    self._worker_slots.release()
+                raise
 
-        for thread in threads:
-            thread.join(timeout=1)
+        with self._worker_processes_lock: # Al salir del loop, espera a que los procesos hijos terminen.
+            workers = list(self._worker_processes)
 
+        for worker in workers:
+            worker.join(timeout=1)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=1)
+
+        self._manager.shutdown() # Cierra el servidor de objetos compartidos.
         logging.info("action: shutdown | result: success | closed: server_socket")
 
     def __handle_client_connection(self, client_sock):
@@ -80,9 +94,9 @@ class Server:
 
         Receives a single framed message and processes it according to its type:
 
-        - "BATCH": parses and stores a batch of bets, responds with ACK/NACK.
-        - "END": marks an agency as finished and refreshes winners snapshot.
-        - "QUERY": returns winners for a given agency if that agency already
+                - "BATCH": parses and stores a batch of bets, responds with ACK/NACK.
+                - "END": marks an agency as finished.
+                - "QUERY": returns winners for a given agency if that agency already
                     sent END; otherwise responds with WAIT.
         """
         addr = ("unknown", 0)
@@ -98,8 +112,11 @@ class Server:
                 message_type = "batch"
                 bets = parse_batch_message(msg)
                 batch_count = len(bets)
-                with self._storage_lock:
+
+                winners_by_agency = self.__extract_winners_by_agency(bets)
+                with self._bets_file_lock:
                     store_bets(bets)
+                self.__append_winners_by_agency(winners_by_agency)
                 logging.info(
                     f"action: apuesta_recibida | result: success | cantidad: {batch_count}"
                 )
@@ -109,9 +126,8 @@ class Server:
             if msg.startswith(END_MSG_TYPE+"|"):
                 message_type = "end"
                 agency = parse_end_message(msg)
-                with self._state_lock:
-                    self._finished_agencies.add(agency)
-                self.__run_winners_by_agency()
+                with self._finished_agencies_lock:
+                    self._finished_agencies[agency] = True
                 logging.info("action: sorteo | result: success")
                 write_frame(client_sock, ACK_OK)
                 return
@@ -119,13 +135,14 @@ class Server:
             if msg.startswith(QUERY_MSG_TYPE+"|"):
                 message_type = "query"
                 agency = parse_query_message(msg)
-                with self._state_lock:
-                    agency_finished = agency in self._finished_agencies
-                    winners = list(self._winners_by_agency.get(agency, []))
+                with self._finished_agencies_lock:
+                    agency_finished = bool(self._finished_agencies.get(agency, False))
 
                 if not agency_finished:
                     write_frame(client_sock, ACK_WAIT)
                     return
+
+                winners = self.__load_winners_for_agency(agency)
 
                 winners_payload = "{}|{}|{}".format(
                     WINNERS_MSG_TYPE,
@@ -162,8 +179,14 @@ class Server:
                 write_frame(client_sock, ACK_FAIL)
             except OSError:
                 pass
+        except Exception as e:
+            logging.error(f"action: process_message | result: fail | error: {e}")
+            try:
+                write_frame(client_sock, ACK_FAIL)
+            except OSError:
+                pass
         finally:
-            self.__remove_client(client_sock)
+            self._worker_slots.release()
             client_sock.close()
 
     def __accept_new_connection(self):
@@ -174,27 +197,55 @@ class Server:
         logging.info('action: accept_connections | result: in_progress')
         c, addr = self._server_socket.accept()
         logging.info(f'action: accept_connections | result: success | ip: {addr[0]}')
-        with self._clients_lock:
-            self._clients.append(c)
         return c
 
-    def __remove_client(self, client_sock):
-        with self._clients_lock:
-            if client_sock in self._clients:
-                self._clients.remove(client_sock)
-
-    def __run_winners_by_agency(self):
+    def __initialize_winners_storage(self):
         """
-        Recomputes winners grouped by agency from persisted bets.
+        Initializes winners storage directory for current server execution.
+        """
+        os.makedirs(WINNERS_DIRPATH, exist_ok=True)
+        for filename in os.listdir(WINNERS_DIRPATH):
+            filepath = os.path.join(WINNERS_DIRPATH, filename)
+            if os.path.isfile(filepath):
+                os.remove(filepath)
 
-        Loads all stored bets, evaluates winners, and replaces the in-memory
-        winners snapshot with:
+    def __winner_file_path(self, agency):
+        return os.path.join(WINNERS_DIRPATH, f"agency-{agency}.winners")
 
-            agency -> list of winner document IDs
+    def __winner_lock_for_agency(self, agency):
+        """
+        Returns a deterministic winners-file lock for a given agency.
+
+        Uses lock striping to keep synchronization simple while reducing
+        unnecessary blocking between different agencies.
         """
 
-        with self._storage_lock:
-            bets = list(load_bets())
+        #  Hash (DETERMINISTICO) de la agencia para asignarle un lock específico entre los disponibles.
+        agency_key = str(agency).encode("utf-8")
+        digest = hashlib.blake2b(agency_key, digest_size=8).digest()
+        idx = int.from_bytes(digest, byteorder="big") % len(self._winners_file_locks)
+        
+
+        return self._winners_file_locks[idx]
+
+    def __reap_finished_workers(self):
+        """
+        Removes finished worker processes from the tracking list.
+        """
+
+        with self._worker_processes_lock:
+            alive_workers = []
+            for worker in self._worker_processes:
+                if worker.is_alive():
+                    alive_workers.append(worker)
+                else:
+                    worker.join(timeout=0)
+            self._worker_processes = alive_workers
+
+    def __extract_winners_by_agency(self, bets):
+        """
+        Builds an in-memory mapping agency -> winner documents for one batch.
+        """
 
         winners_by_agency = {}
         for bet in bets:
@@ -204,5 +255,25 @@ class Server:
                     winners_by_agency[agency] = []
                 winners_by_agency[agency].append(str(bet.document))
 
-        with self._state_lock:
-            self._winners_by_agency = winners_by_agency
+        return winners_by_agency
+
+    def __append_winners_by_agency(self, winners_by_agency):
+        """
+        Appends winner documents grouped by agency to winners files.
+        """
+
+        for agency, documents in winners_by_agency.items():
+            filepath = self.__winner_file_path(agency)
+            with self.__winner_lock_for_agency(agency):
+                with open(filepath, "a", encoding="utf-8") as file:
+                    for document in documents:
+                        file.write(f"{document}\n")
+
+    def __load_winners_for_agency(self, agency):
+        filepath = self.__winner_file_path(agency)
+        with self.__winner_lock_for_agency(agency):
+            if not os.path.exists(filepath):
+                return []
+
+            with open(filepath, "r", encoding="utf-8") as file:
+                return [line.strip() for line in file if line.strip()]

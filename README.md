@@ -10,19 +10,22 @@ Modificar el servidor para que permita aceptar conexiones y procesar mensajes en
 
 ### Consideraciones sobre GIL y diseño elegido
 - Python (CPython) usa GIL, por lo que los hilos no paralelizan bien trabajo puramente CPU-bound.
-- En este TP, el servidor es principalmente I/O-bound (sockets y acceso a archivo), por lo que _multithreading_ sigue siendo una opción válida y efectiva para escalar conexiones concurrentes.
-- Para evitar corrupción de datos en persistencia y condiciones de carrera en estado compartido, se agregaron locks explícitos.
+- Para evitar esa limitación y preparar el servidor para cargas grandes, la implementación usa _multiprocessing_ (un proceso worker por conexión).
+- La sincronización sobre estado compartido y persistencia se resuelve con locks multiprocess.
 
-### Por qué multithreading y cuándo migrar a multiprocessing
-- Se eligió _multithreading_ porque el cuello de botella principal es I/O (espera de red y acceso a disco), no cálculo intensivo.
-- Este enfoque mantiene el diseño simple para el scope del ejercicio: un thread por conexión y sincronización con locks en recursos compartidos.
-- Debería migrarse a _multiprocessing_ si el servidor incorpora etapas CPU-bound relevantes (por ejemplo, validaciones complejas por apuesta, agregaciones pesadas o postprocesamiento intensivo de ganadores) y se observa que el uso de CPU queda limitado por el GIL.
-- Señales prácticas para migrar:
-  - CPU alta sostenida en un solo núcleo con baja mejora al aumentar threads.
-  - Mayor latencia en consultas bajo carga aunque la red no esté saturada.
-  - Contención creciente en locks por trabajo de cómputo dentro de secciones críticas.
-- Estrategia recomendada de migración: mantener sockets en el proceso principal y delegar tareas CPU-bound a un pool de procesos (worker pool), minimizando cambios en el protocolo de comunicación.
+### Nota sobre la arquitectura de procesos vs. hilos
+- Si bien esta versión utiliza _multiprocessing_ para garantizar paralelismo real frente al GIL, aclaro que me siento mucho más cómodo con la simpleza de mi versión anterior _multithreading_ que tiene una lógica más simple y legible (se puede ver en mi commit anterior `Commit c04f5e9` - `feat (ej8): se completó el ejercicio 8`)
 
+### Por qué multiprocessing en esta versión
+- Se eligió _multiprocessing_ para escalar mejor frente a cargas muy grandes y evitar depender del paralelismo limitado por GIL.
+- El servidor acepta conexiones en el proceso principal y delega cada conexión a un proceso worker.
+- Se evitó recalcular ganadores recorriendo todos los registros en memoria: los documentos ganadores se persisten incrementalmente durante la recepción de cada batch.
+
+### Nota técnica: Python moderno, GIL y decisión de arquitectura
+- En versiones actuales de CPython, el modelo por defecto todavía usa GIL.
+- Desde Python 3.13 existe una variante free-threaded (sin GIL) habilitada como build opcional, no como configuración estándar.
+- Esa variante todavía tiene adopción parcial del ecosistema y puede implicar diferencias de rendimiento o compatibilidad en extensiones nativas.
+- Si en el futuro el entorno objetivo usa de forma estable Python sin GIL, una solución multithreading como la del commit anterior podría volver a ser muy competitiva por menor overhead de creación/sincronización respecto de procesos.
 
 
 ## Cambios implementados
@@ -54,25 +57,43 @@ Modificar el servidor para que permita aceptar conexiones y procesar mensajes en
 
 
 ### Servidor
-- Acepta conexiones en paralelo y crea un thread por cliente.
+- Acepta conexiones en paralelo y crea un proceso worker por cliente.
+- Limita la concurrencia con `max_workers` (configurable por `SERVER_MAX_WORKERS`) para evitar creación ilimitada de procesos.
 - Recibe un mensaje batch por conexión.
 - Parsea el payload con `parse_batch_message(...)`.
-- Si todas las apuestas son válidas, persiste el lote con `store_bets(bets)` y responde `ACK|OK`.
+- Si todas las apuestas son válidas, persiste el lote con `store_bets(bets)` y, en la misma operación, persiste solo los ganadores del lote por agencia.
 - Si alguna apuesta falla, responde `ACK|FAIL`.
 - Mantiene el estado de agencias que notificaron fin de envío (`END`).
-- Cuando llega `END` de una agencia, recalcula ganadores y loguea:
+- Cuando llega `END` de una agencia, marca agencia finalizada y loguea:
   - `action: sorteo | result: success`
 - Responde consultas de ganadores por agencia (`QUERY`):
   - Si la agencia aún no notificó `END`: `ACK|WAIT`
-  - Si la agencia ya notificó `END`: `WINNERS|count|...`
+  - Si la agencia ya notificó `END`: `WINNERS|count|dni1,dni2,...`
 - Sincronización aplicada:
-  - `storage_lock`: serializa escritura/lectura de `STORAGE_FILEPATH`.
-  - `state_lock`: protege estructuras compartidas (`finished_agencies`, `winners_by_agency`).
-  - `clients_lock`: protege altas/bajas de sockets y lista de threads.
-- Logs principales:
-  - `action: apuesta_recibida | result: success | cantidad: ${CANTIDAD_DE_APUESTAS}`
-  - `action: apuesta_recibida | result: fail | cantidad: ${CANTIDAD_DE_APUESTAS}`
-  - `action: sorteo | result: success`
+  - `bets_file_lock`: serializa la escritura de `STORAGE_FILEPATH`.
+  - `winners_file_locks` (lock striping): sincroniza accesos a archivos de ganadores por agencia y reduce contención entre agencias distintas.
+  - `finished_agencies_lock`: protege estructuras compartidas de agencias finalizadas.
+  - `worker_processes_lock`: protege la lista de procesos workers.
+  - `worker_slots` (semáforo): limita la cantidad de workers activos en simultáneo.
+
+### Detalle: Lock Striping y parámetro 16
+- `winners_file_locks` usa una técnica de lock striping: en lugar de un lock global para todos los archivos de ganadores, se mantiene un pool de 16 locks.
+- Cada agencia se mapea de forma determinística a un lock con un hash estable (`blake2b`) y módulo 16.
+- Esto permite que agencias distintas escriban/lean en paralelo cuando caen en locks diferentes, reduciendo la contención frente a un lock único.
+- El valor 16 es un equilibrio práctico: evita el serializado total (1) sin sobredimensionar la cantidad de locks (valores muy altos).
+
+### Detalle: cómo funciona el reap de workers
+- El servidor guarda referencias a procesos hijos en `worker_processes`.
+- En cada iteración del loop principal ejecuta `__reap_finished_workers()`.
+- Ese método filtra procesos vivos y elimina/`join()` los finalizados, evitando crecimiento indefinido de la lista y acumulación de procesos zombie.
+- En shutdown, se hace un `join(timeout)` final y, si algún proceso sigue vivo, `terminate()` para cierre ordenado.
+
+### Límite de concurrencia para miles de agencias
+- El servidor no crea procesos de forma infinita: antes de aceptar y despachar una conexión, adquiere un slot de `worker_slots`.
+- Si se alcanza `max_workers`, el loop principal espera a que un worker termine y libere su slot.
+- Mientras tanto, las nuevas conexiones quedan esperando en el backlog TCP (`SERVER_LISTEN_BACKLOG`) en lugar de disparar más procesos.
+- Esto reduce riesgo de agotamiento de memoria y exceso de context-switch bajo picos de carga.
+
 
 
 ## Cómo probar
