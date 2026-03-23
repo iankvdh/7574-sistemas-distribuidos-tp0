@@ -2,7 +2,7 @@ import sys
 
 
 def generar_compose(archivo_de_salida, cantidad_de_clientes):
-    contenido = """name: tp0
+    contenido = f"""name: tp0
 services:
   server:
     container_name: server
@@ -12,6 +12,7 @@ services:
       - ./server/config.ini:/config.ini:ro
     environment:
       - PYTHONUNBUFFERED=1
+      - AGENCIES_EXPECTED={cantidad_de_clientes}
     networks:
       - testing_net
 

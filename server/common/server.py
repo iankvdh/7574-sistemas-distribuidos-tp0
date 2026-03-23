@@ -8,15 +8,16 @@ from protocol.protocol import read_frame, write_frame, ACK_OK, ACK_FAIL, ACK_WAI
 
 
 class Server:
-    def __init__(self, port, listen_backlog):
+    def __init__(self, port, listen_backlog, agencies_expected):
         # Initialize server socket
         self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_socket.bind(('', port))
         self._server_socket.listen(listen_backlog)
         self._running = True
         self._clients = []
+        self._agencies_expected = agencies_expected
         self._finished_agencies = set()
-        self._bets_over = False
+        self._sorteo_realizado = False
         self._winners_by_agency = {}
 
     def _handle_sigterm(self, signum, frame):
@@ -71,6 +72,7 @@ class Server:
         """
         addr = ("unknown", 0)
         batch_count = 0
+        message_type = "unknown"
         try:
             addr = client_sock.getpeername()
 
@@ -78,6 +80,7 @@ class Server:
             logging.info(f'action: receive_message | result: success | ip: {addr[0]}')
 
             if msg.startswith(BATCH_MSG_TYPE+"\n"):
+                message_type = BATCH_MSG_TYPE
                 bets = parse_batch_message(msg)
                 batch_count = len(bets)
                 store_bets(bets)
@@ -88,16 +91,25 @@ class Server:
                 return
 
             if msg.startswith(END_MSG_TYPE+"|"):
+                message_type = END_MSG_TYPE
                 agency = parse_end_message(msg)
                 self._finished_agencies.add(agency)
-                self.__run_winners_by_agency()
-                logging.info("action: sorteo | result: success")
+                
+                # Solo ejecutar sorteo cuando todas las agencias hayan notificado
+                if len(self._finished_agencies) == self._agencies_expected and not self._sorteo_realizado:
+                    self.__run_winners_by_agency()
+                    self._sorteo_realizado = True
+                    logging.info("action: sorteo | result: success")
+                
                 write_frame(client_sock, ACK_OK)
                 return
 
             if msg.startswith(QUERY_MSG_TYPE+"|"):
+                message_type = QUERY_MSG_TYPE
                 agency = parse_query_message(msg)
-                if agency not in self._finished_agencies:
+                
+                # Esperar a que el sorteo esté completo antes de responder
+                if not self._sorteo_realizado:
                     write_frame(client_sock, ACK_WAIT)
                     return
 
@@ -122,10 +134,17 @@ class Server:
                 write_frame(client_sock, ACK_FAIL)
             except OSError:
                 pass
-        except ValueError:
-            logging.info(
-                f"action: apuesta_recibida | result: fail | cantidad: {batch_count}"
-            )
+        except ValueError as e:
+            if message_type == BATCH_MSG_TYPE:
+                logging.info(
+                    f"action: apuesta_recibida | result: fail | cantidad: {batch_count}"
+                )
+            elif message_type == END_MSG_TYPE:
+                logging.info(f"action: fin_envio | result: fail | error: {e}")
+            elif message_type == QUERY_MSG_TYPE:
+                logging.info(f"action: consulta_ganadores | result: fail | error: {e}")
+            else:
+                logging.info(f"action: receive_message | result: fail | error: {e}")
             try:
                 write_frame(client_sock, ACK_FAIL)
             except OSError:
@@ -152,13 +171,15 @@ class Server:
         """
         Computes winners grouped by agency.
 
-        Marks the betting phase as finished, loads all stored bets,
-        evaluates which bets have won, and builds an in-memory mapping:
+        Loads all stored bets, evaluates which bets have won, and builds
+        an in-memory mapping:
 
             agency -> list of winner document IDs
+        
+        This method is called ONLY ONCE when all agencies have notified
+        that they finished sending bets.
         """
 
-        self._bets_over = True
         self._winners_by_agency = {}
         bets = list(load_bets())
         for bet in bets:

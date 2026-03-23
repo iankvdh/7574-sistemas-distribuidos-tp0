@@ -7,8 +7,8 @@ Modificar los clientes para que notifiquen al servidor al finalizar con el enví
 Inmediatamente después de la notificacion, los clientes consultarán la lista de ganadores del sorteo correspondientes a su agencia.
 Una vez el cliente obtenga los resultados, deberá imprimir por log: `action: consulta_ganadores | result: success | cant_ganadores: ${CANT}`.
 
-En esta implementación, el servidor recalcula los ganadores cuando recibe cada `END|agency` y habilita la respuesta de `QUERY|agency` para esa agencia.
-Antes de que una agencia notifique `END`, sus consultas reciben `ACK|WAIT` y no se responde con información parcial para esa agencia.
+El servidor deberá esperar la notificación de las 5 agencias para considerar que se realizó el sorteo e imprimir por log: `action: sorteo | result: success`.
+Luego de este evento, podrá verificar cada apuesta con las funciones `load_bets(...)` y `has_won(...)` y retornar los DNI de los ganadores de la agencia en cuestión. Antes del sorteo no se podrán responder consultas por la lista de ganadores con información parcial.
 
 Las funciones `load_bets(...)` y `has_won(...)` son provistas por la cátedra y no podrán ser modificadas por el alumno.
 
@@ -16,6 +16,20 @@ No es correcto realizar un broadcast de todos los ganadores hacia todas las agen
 
 
 ## Cambios implementados
+
+### Implementación de sincronización del sorteo
+
+El servidor implementa un mecanismo de sincronización para garantizar que:
+
+1. **Espera a todas las agencias**: El servidor cuenta las notificaciones `END` y solo ejecuta el sorteo cuando **todas las agencias esperadas** han notificado que terminaron.
+
+2. **Sorteo único**: El método `__run_winners_by_agency()` se ejecuta **una única vez** cuando la última agencia notifica `END`.
+
+3. **Bloqueo de consultas prematuras**: Antes de que el sorteo esté completo, todas las consultas `QUERY` reciben `ACK|WAIT`, sin importar si la agencia ya notificó `END` o no.
+
+4. **Configuración dinámica**: El número de agencias esperadas se configura mediante:
+   - Variable de entorno `AGENCIES_EXPECTED` (generada automáticamente por `generar-compose.sh`)
+   - Valor por defecto en `server/config.ini`: `AGENCIES_EXPECTED = 5`
 
 ### Protocolo de comunicación
 - Se mantiene framing binario para transporte en sockets:
@@ -49,16 +63,17 @@ No es correcto realizar un broadcast de todos los ganadores hacia todas las agen
 - Si todas las apuestas son válidas, persiste el lote con `store_bets(bets)` y responde `ACK|OK`.
 - Si alguna apuesta falla, responde `ACK|FAIL`.
 - Mantiene el estado de agencias que notificaron fin de envío (`END`).
-- Cuando llega `END` de una agencia, recalcula ganadores y loguea:
-  - `action: sorteo | result: success`
+- **Sincronización del sorteo**:
+  - Cuenta las notificaciones `END` de cada agencia
+  - Cuando **todas las agencias esperadas** han notificado, ejecuta el sorteo **una única vez**
+  - Loguea: `action: sorteo | result: success`
 - Responde consultas de ganadores por agencia (`QUERY`):
-  - Si la agencia aún no notificó `END`: `ACK|WAIT`
-  - Si la agencia ya notificó `END`: `WINNERS|count|...`
+  - **Antes del sorteo completo**: `ACK|WAIT`
+  - **Después del sorteo**: `WINNERS|count|dni1,dni2,...` con los ganadores de esa agencia
 - Logs principales:
   - `action: apuesta_recibida | result: success | cantidad: ${CANTIDAD_DE_APUESTAS}`
   - `action: apuesta_recibida | result: fail | cantidad: ${CANTIDAD_DE_APUESTAS}`
   - `action: sorteo | result: success`
-
 
 ## Cómo probar
 
