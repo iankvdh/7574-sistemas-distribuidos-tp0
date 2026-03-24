@@ -210,10 +210,10 @@ class Server:
             write_frame(client_sock, winners_payload.encode("utf-8"))
             
             logging.info(
-                f"action: consulta_ganadores | result: success | cant_ganadores: {len(winners)}"
+                f"action: query_procesada | result: success | cant_ganadores: {len(winners)}"
             )
         except Exception as e:
-            logging.info(f"action: consulta_ganadores | result: fail | error: {e}")
+            logging.info(f"action: query_procesada | result: fail | error: {e}")
             try:
                 write_frame(client_sock, ACK_FAIL)
             except OSError:
