@@ -61,42 +61,51 @@ func (c *Client) sendBatch(bets []Bet) error {
 	if err != nil {
 		return err
 	}
-	return nil
-}
 
-func (c *Client) sendControlMessage(message string) (string, error) {
-	err := c.createClientSocket()
-	if err != nil {
-		return "", err
-	}
-
-	err = protocol.WriteFrame(c.conn, []byte(message))
-	if err != nil {
-		c.conn.Close()
-		return "", err
-	}
-
-	payload, err := protocol.ReadFrame(c.conn)
-	c.conn.Close()
-	if err != nil {
-		return "", err
-	}
-
-	return string(payload), nil
-}
-
-func (c *Client) notifyFinished() error {
-	resp, err := c.sendControlMessage(EndMsgType + "|" + c.config.ID)
+	ackPayload, err := protocol.ReadFrame(c.conn)
 	if err != nil {
 		return err
 	}
-	if resp != protocol.ExpectedACK {
+
+	ack := string(ackPayload)
+	if ack == protocol.ExpectedNACK {
+		return fmt.Errorf("server returned fail ACK for batch")
+	}
+
+	if ack != protocol.ExpectedACK {
+		return fmt.Errorf("invalid ACK payload")
+	}
+
+	log.Infof(
+		"action: batch_enviado | result: success | cantidad: %s | client_id: %s",
+		strconv.Itoa(len(bets)),
+		c.config.ID,
+	)
+
+	return nil
+}
+
+func (c *Client) notifyFinished() error {
+	message := EndMsgType + "|" + c.config.ID
+	err := protocol.WriteFrame(c.conn, []byte(message))
+	if err != nil {
+		return err
+	}
+
+	resp, err := protocol.ReadFrame(c.conn)
+	if err != nil {
+		return err
+	}
+
+	if string(resp) != protocol.ExpectedACK {
 		return fmt.Errorf("invalid END response")
 	}
+
 	return nil
 }
 
 func (c *Client) queryWinners(stop <-chan struct{}) (int, error) {
+	waitTime := 100 * time.Millisecond
 	for {
 		select {
 		case <-stop:
@@ -104,21 +113,32 @@ func (c *Client) queryWinners(stop <-chan struct{}) (int, error) {
 		default:
 		}
 
-		resp, err := c.sendControlMessage(QueryMsgType + "|" + c.config.ID)
+		message := QueryMsgType + "|" + c.config.ID
+		err := protocol.WriteFrame(c.conn, []byte(message))
 		if err != nil {
 			return 0, err
 		}
 
-		if resp == protocol.ExpectedACKWait {
-			time.Sleep(200 * time.Millisecond)
+		resp, err := protocol.ReadFrame(c.conn)
+		if err != nil {
+			return 0, err
+		}
+
+		respStr := string(resp)
+		if respStr == protocol.ExpectedACKWait {
+			time.Sleep(waitTime)
+			// Exponential backoff: dobla el tiempo, máximo 2 segundos
+			if waitTime < 2*time.Second {
+				waitTime *= 2
+			}
 			continue
 		}
 
-		if !strings.HasPrefix(resp, WinnersMsgType+"|") {
+		if !strings.HasPrefix(respStr, WinnersMsgType+"|") {
 			return 0, fmt.Errorf("invalid QUERY response")
 		}
 
-		parts := strings.SplitN(resp, "|", 3)
+		parts := strings.SplitN(respStr, "|", 3)
 		if len(parts) < 2 {
 			return 0, fmt.Errorf("invalid winners payload")
 		}
@@ -145,44 +165,18 @@ func (c *Client) sendBatches(stop <-chan struct{}) error {
 			end = len(c.bets)
 		}
 
-		err := c.createClientSocket()
-		if err != nil {
-			return err
-		}
-
 		batch := c.bets[i:end]
-		err = c.sendBatch(batch)
-		if err != nil {
-			c.conn.Close()
-			return err
-		}
-
-		ackPayload, err := protocol.ReadFrame(c.conn)
-		c.conn.Close()
+		err := c.sendBatch(batch)
 		if err != nil {
 			return err
 		}
-
-		ack := string(ackPayload)
-		if ack == protocol.ExpectedNACK {
-			return fmt.Errorf("server returned fail ACK for batch size %d", len(batch))
-		}
-
-		if ack != protocol.ExpectedACK {
-			return fmt.Errorf("invalid ACK payload")
-		}
-
-		log.Infof(
-			"action: batch_enviado | result: success | cantidad: %s | client_id: %s",
-			strconv.Itoa(len(batch)),
-			c.config.ID,
-		)
 	}
 
 	return nil
 }
 
-// StartClientLoop Send messages to the client until some time threshold is met
+// StartClient se conecta al server y hace todo esto por la misma conexión persistente:
+// sendBatches -> notifyFinished -> queryWinners
 func (c *Client) StartClient() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM)
@@ -208,7 +202,20 @@ func (c *Client) StartClient() {
 	default:
 	}
 
-	err := c.sendBatches(stop)
+	// Crea una conexión persistente
+	err := c.createClientSocket()
+	if err != nil {
+		log.Errorf(
+			"action: connect | result: fail | client_id: %v | error: %v",
+			c.config.ID,
+			err,
+		)
+		return
+	}
+	defer c.conn.Close()
+
+	// Manda todos los batches
+	err = c.sendBatches(stop)
 	if err != nil {
 		log.Errorf(
 			"action: send_batch | result: fail | client_id: %v | error: %v",
@@ -220,6 +227,7 @@ func (c *Client) StartClient() {
 
 	log.Infof("action: batches_enviados | result: success | client_id: %v", c.config.ID)
 
+	// Notifica que ya mandó todos los batches
 	err = c.notifyFinished()
 	if err != nil {
 		log.Errorf(
@@ -229,6 +237,7 @@ func (c *Client) StartClient() {
 		)
 		return
 	}
+	log.Infof("action: fin_envio | result: success | client_id: %v", c.config.ID)
 
 	count, err := c.queryWinners(stop)
 	if err != nil {
