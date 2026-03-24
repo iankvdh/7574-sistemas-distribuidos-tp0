@@ -137,7 +137,7 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 ---
 
-### Servidor (Python)
+### Servidor
 
 #### Main Loop (`run()`)
 ```
@@ -186,6 +186,33 @@ while self._running:
 | `sorteo_lock` | Lock | Protege sección crítica del sorteo |
 | `sorteo_realizado` | Value('b') | Flag atómico (False/True) |
 
+
+### Mecanismos de sincronización en el servidor
+
+El servidor usa `multiprocessing.Manager()` para compartir estado entre procesos hijos. Esto evita race conditions sobre memoria compartida y permite que cada worker acceda ordenado a los datos.
+- `self._bets_lock` (Lock)
+  - Protege tanto la escritura (`store_bets`) como la lectura del sorteo (`load_bets`).
+
+- `self._finished_agencies` (Manager.dict)
+  - Marca qué agencias recibieron su `END`.
+  - Se usa para saber si se puede disparar el sorteo.
+  - Guardamos `agency` como string por consistencia con keys en `winners_by_agency`.
+
+- `self._sorteo_lock` (Lock) + `self._sorteo_realizado` (Value('b'))
+  - `sorteo_lock` protege la sección crítica donde se calcula una sola vez el sorteo.
+  - Patrón double-check:
+    1. Si `len(finished_agencies) == expected`, intenta entrar al lock.
+    2. Dentro del lock, chequear `if not self._sorteo_realizado.value`.
+    3. Si sigue falso, correr `__run_winners_by_agency`, luego `self._sorteo_realizado.value=True`.
+  - Esto evita que dos procesos (caso de END concurrentes) ejecuten sorteo al mismo tiempo o más de una vez.
+
+- `self._winners_by_agency` (Manager.dict) (cache de resultados)
+  - Mapa de agency -> lista de DNI ganadores.
+  - Se construye en `__run_winners_by_agency()` usando dict local y luego asigando por agencia para evitar problemas de `append` en listas compartidas.
+
+- `signal.signal(signal.SIGTERM, signal.SIG_IGN)` en cada proceso hijo
+  - Los hijos ignoran SIGTERM y evitan ejecutar `__shutdown()` individualmente.
+  - El padre recibe SIGTERM, pone `_running=False`, y hace `__shutdown()` sincronizado.
 
 ---
 
