@@ -169,7 +169,7 @@ class Server:
         Handle END message: mark agency as finished, trigger draw if all agencies done.
         """
         try:
-            agency = parse_end_message(msg)
+            agency = str(parse_end_message(msg))
             
             # Marcamos la agencia como finalizada
             self._finished_agencies[agency] = 1
@@ -194,7 +194,7 @@ class Server:
         Handle QUERY message: return winners if draw is complete, else WAIT.
         """
         try:
-            agency = parse_query_message(msg)
+            agency = str(parse_query_message(msg))  # Asegurar string como clave
             
             # Si todavía no se hizo el sorteo, decimos que espere
             if not self._sorteo_realizado.value:
