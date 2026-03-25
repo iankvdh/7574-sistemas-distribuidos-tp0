@@ -8,7 +8,8 @@ import (
 )
 
 const (
-	batchMsgType = "BATCH"
+	batchMsgType    = "BATCH"
+	batchHeaderSize = 6 // "BATCH\n"
 )
 
 // LoadBetsFromCSV lee las apuestas de una agencia desde un archivo CSV

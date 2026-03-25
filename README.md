@@ -106,6 +106,7 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 ```
 [2 bytes big-endian: len(payload)][payload string UTF-8]
 ```
+**MTU**: Se definió un límite estricto de `8kB (MaxPayloadSize)` bytes por frame (tanto el emisor como el receptor validan el tamaño del payload)
 
 **Mensajes**:
 | Tipo | Formato | Dirección | Respuesta |
@@ -119,9 +120,9 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 ### Cliente
 
 **Flujo**:
-1. **Carga apuestas** desde CSV `/data/agency-{ID}.csv`
-2. **Divide en batches** (tamaño configurable)
-3. **Abre TCP una sola vez** → `net.Dial("tcp", serverAddr)`
+1. **Carga apuestas** desde CSV `/data/agency-{ID}.csv` y mapea a estructuras Bet.
+2. **Abre TCP una sola vez** → `net.Dial("tcp", serverAddr)`
+3. **Divide en batches** (tamaño configurable y dinámico)
 4. **Envía batches en loop** por la misma conexión
    - Espera `ACK|OK/FAIL` antes del siguiente
 5. **Notifica END** → `END|agency_id`
@@ -134,6 +135,9 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 - Goroutine que escucha `syscall.SIGTERM`
 - Activa canal `stop` para interrumpir loops
 - Cierra socket cuello limpio
+
+**Batching Dinámico**: 
+- El cliente ya no solo corta por `maxAmount` (80 apuestas). Ahora implementa un cálculo dinámico de bytes en tiempo real. Si el acumulado de apuestas más el encabezado `BATCH\n` alcanza los `8kB (MaxPayloadSize)`, el cliente cierra el batch y lo envía, garantizando que nunca se viole el límite del protocolo.
 
 ---
 

@@ -153,20 +153,49 @@ func (c *Client) queryWinners(stop <-chan struct{}) (int, error) {
 }
 
 func (c *Client) sendBatches(stop <-chan struct{}) error {
-	for i := 0; i < len(c.bets); i += c.config.BatchMaxAmount {
+
+	currentBatch := make([]Bet, 0, c.config.BatchMaxAmount)
+	currentBytes := batchHeaderSize
+
+	for i := 0; i < len(c.bets); i++ {
 		select {
 		case <-stop:
 			return fmt.Errorf("client stopped")
 		default:
 		}
 
-		end := i + c.config.BatchMaxAmount
-		if end > len(c.bets) {
-			end = len(c.bets)
+		bet := c.bets[i]
+		betSize := len(bet.ToRow()) + 1 // +1 para el \n
+
+		// Chequeamos que una apuesta individual (más encabezado) no exceda el MaxPayloadSize bytes
+		if batchHeaderSize+betSize > protocol.MaxPayloadSize {
+			return fmt.Errorf("single bet message size (%d bytes) exceeds limit of %d bytes", batchHeaderSize+betSize, protocol.MaxPayloadSize)
 		}
 
-		batch := c.bets[i:end]
-		err := c.sendBatch(batch)
+		// Vemos si agregar esta apuesta excedería los límites
+		wouldExceedSize := currentBytes+betSize > protocol.MaxPayloadSize
+		wouldExceedCount := len(currentBatch)+1 > c.config.BatchMaxAmount
+
+		if wouldExceedSize || wouldExceedCount {
+			if len(currentBatch) > 0 {
+				err := c.sendBatch(currentBatch)
+				if err != nil {
+					return err
+				}
+			}
+			// Reiniciamos el batch para la próxima tanda
+			currentBatch = currentBatch[:0]
+			currentBytes = batchHeaderSize
+		}
+
+		// Agregar la apuesta al batch
+		currentBatch = append(currentBatch, bet)
+		currentBytes += betSize
+	}
+
+	// Envía el último batch si no está vacío
+	if len(currentBatch) > 0 {
+		err := c.sendBatch(currentBatch)
 		if err != nil {
 			return err
 		}
