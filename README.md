@@ -34,6 +34,7 @@ El servidor implementa un mecanismo de sincronización para garantizar que:
 ### Protocolo de comunicación
 - Se mantiene framing binario para transporte en sockets:
   - `[2 bytes tamaño][payload]`.
+  - **MTU**: Se definió un límite estricto de `8kB (MaxPayloadSize)` bytes por frame (tanto el emisor como el receptor validan el tamaño del payload)
 - El payload de negocio para apuestas por lote se define como:
   - `BATCH\n`
   - `agency|first_name|last_name|document|birthdate|number\n` (una línea por apuesta).
@@ -49,12 +50,15 @@ El servidor implementa un mecanismo de sincronización para garantizar que:
 
 ### Cliente
 - Carga apuestas desde el CSV de su agencia (`/data/agency-{ID}.csv`) usando `LoadBetsFromCSV(...)`.
-- Divide la lista en lotes con tamaño máximo configurable por `batch.maxAmount`.
+- Divide la lista en lotes con tamaño máximo configurable por `batch.maxAmount` (tamaño configurable y dinámico).
 - Envía cada lote como un único mensaje y espera ACK/NACK del servidor.
 - Al terminar de enviar todos los lotes, envía `END|agency` al servidor.
 - Luego realiza `QUERY|agency` hasta recibir una respuesta de ganadores.
 - Cuando obtiene la respuesta final, loguea:
   - `action: consulta_ganadores | result: success | cant_ganadores: ${CANT}`
+
+**Batching Dinámico**: 
+- El cliente ya no solo corta por `maxAmount` (80 apuestas). Ahora implementa un cálculo dinámico de bytes en tiempo real. Si el acumulado de apuestas más el encabezado `BATCH\n` alcanza los `8kB (MaxPayloadSize)`, el cliente cierra el batch y lo envía, garantizando que nunca se viole el límite del protocolo.  
 
 
 ### Servidor
