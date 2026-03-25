@@ -7,17 +7,18 @@ import (
 )
 
 const (
-	ExpectedACK  = "ACK|OK"
-	ExpectedNACK = "ACK|FAIL"
+	ExpectedACK    = "ACK|OK"
+	ExpectedNACK   = "ACK|FAIL"
+	MaxPayloadSize = 8192
 )
 
 // WriteFrame escribe un frame en conexión con el formato:
 // 2 bytes size (uint16 big-endian)][payload]
 // Maneja posibles short-writes iterando hasta que se escriban todos los bytes.
 func WriteFrame(conn io.Writer, payload []byte) error {
-	// Valida que el tamaño del payload entre en un uint16
-	if len(payload) > 65535 {
-		return fmt.Errorf("payload too large: %d bytes", len(payload))
+	// Valida que el tamaño del payload no exceda 8192 bytes
+	if len(payload) > MaxPayloadSize {
+		return fmt.Errorf("payload too large: %d bytes (max: %d)", len(payload), MaxPayloadSize)
 	}
 
 	// Crea el frame: [2 bytes header][payload]

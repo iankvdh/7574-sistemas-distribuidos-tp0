@@ -21,6 +21,7 @@ Por su parte, el servidor deberá responder con éxito solamente si todas las ap
 ### Protocolo de comunicación
 - Se mantiene framing binario para transporte en sockets:
   - `[2 bytes tamaño][payload]`.
+  - **MTU**: Se definió un límite estricto de `8kB (MaxPayloadSize)` bytes por frame (tanto el emisor como el receptor validan el tamaño del payload)
 - El payload de negocio para batches se define como:
   - `BATCH\n`
   - `agency|first_name|last_name|document|birthdate|number\n` (una línea por apuesta).
@@ -32,9 +33,11 @@ Por su parte, el servidor deberá responder con éxito solamente si todas las ap
 ### Cliente
 - El cliente ya no toma una apuesta individual desde env vars para el envío.
 - Carga apuestas desde el CSV de su agencia (`/data/agency.csv`) usando `LoadBetsFromCSV(...)`.
-- Divide la lista en lotes con tamaño máximo configurable por `batch.maxAmount`.
+- Divide la lista en lotes con tamaño máximo configurable por `batch.maxAmount` (tamaño configurable y dinámico).
 - Envía cada lote como un único mensaje y espera ACK/NACK del servidor.
-- `batch.maxAmount` por defecto se ajustó a `80` para mantener paquetes por debajo de 8kB (empírico en base a los datasets dados).
+
+**Batching Dinámico**: 
+- El cliente ya no solo corta por `maxAmount` (80 apuestas). Ahora implementa un cálculo dinámico de bytes en tiempo real. Si el acumulado de apuestas más el encabezado `BATCH\n` alcanza los `8kB (MaxPayloadSize)`, el cliente cierra el batch y lo envía, garantizando que nunca se viole el límite del protocolo.  
 
 
 ### Servidor

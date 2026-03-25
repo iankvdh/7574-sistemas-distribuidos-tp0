@@ -5,7 +5,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/docker-compose-init/client/protocol"
@@ -63,24 +62,24 @@ func (c *Client) sendBatch(bets []Bet) error {
 }
 
 func (c *Client) sendBatches(stop <-chan struct{}) error {
-	for i := 0; i < len(c.bets); i += c.config.BatchMaxAmount {
+	i := 0
+	for i < len(c.bets) {
 		select {
 		case <-stop:
 			return fmt.Errorf("client stopped")
 		default:
 		}
 
-		end := i + c.config.BatchMaxAmount
-		if end > len(c.bets) {
-			end = len(c.bets)
-		}
-
-		err := c.createClientSocket()
+		batch, nextIndex, err := c.determineNextBatch(i)
 		if err != nil {
 			return err
 		}
 
-		batch := c.bets[i:end]
+		err = c.createClientSocket()
+		if err != nil {
+			return err
+		}
+
 		err = c.sendBatch(batch)
 		if err != nil {
 			c.conn.Close()
@@ -95,21 +94,47 @@ func (c *Client) sendBatches(stop <-chan struct{}) error {
 
 		ack := string(ackPayload)
 		if ack == protocol.ExpectedNACK {
-			return fmt.Errorf("server returned fail ACK for batch size %d", len(batch))
+			return fmt.Errorf("server returned fail ACK for batch starting at %d", i)
 		}
-
 		if ack != protocol.ExpectedACK {
 			return fmt.Errorf("invalid ACK payload")
 		}
 
 		log.Infof(
-			"action: batch_enviado | result: success | cantidad: %s | client_id: %s",
-			strconv.Itoa(len(batch)),
+			"action: batch_enviado | result: success | cantidad: %d | client_id: %s",
+			len(batch),
 			c.config.ID,
 		)
+		i = nextIndex
 	}
 
 	return nil
+}
+
+func (c *Client) determineNextBatch(startIndex int) ([]Bet, int, error) {
+	var batch []Bet
+	currentBytes := batchHeaderSize
+
+	for j := startIndex; j < len(c.bets); j++ {
+		bet := c.bets[j]
+		betSize := len(bet.ToRow()) + 1
+
+		if batchHeaderSize+betSize > protocol.MaxPayloadSize {
+			if len(batch) == 0 {
+				return nil, 0, fmt.Errorf("bet at index %d is too large (%d bytes) for protocol limit", j, batchHeaderSize+betSize)
+			}
+			break
+		}
+
+		if currentBytes+betSize > protocol.MaxPayloadSize || len(batch)+1 > c.config.BatchMaxAmount {
+			break
+		}
+
+		batch = append(batch, bet)
+		currentBytes += betSize
+	}
+
+	return batch, startIndex + len(batch), nil
 }
 
 // StartClientLoop Send messages to the client until some time threshold is met
