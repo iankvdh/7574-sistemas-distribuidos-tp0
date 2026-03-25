@@ -85,17 +85,6 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 - Resultado: múltiples procesos cerrando Manager, matando procesos ajenos, etc.
 - Ahora: solo el padre maneja shutdown, los hijos mueren limpiamente.
 
-### Backoff Exponencial en Queries (Clientе)
-
-**Cambio en `queryWinners()`**:
-- Antes: Esperaba fijan **200ms** si recibía `ACK|WAIT`.
-- Ahora: 
-  - Comienza en **100ms**
-  - Se duplica en cada WAIT (100ms → 200ms → 400ms → 800ms → 1600ms)
-  - Cap máximo: **2 segundos**
-
-**Razón**: Si el sorteo tarda, no queremos bombardear al servidor con queries cada 200ms. El backoff exponencial reduce carga innecesaria.
-
 ---
 
 ## Decisiones de Diseño
@@ -113,7 +102,7 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 |------|---------|-----------|-----------|
 | BATCH | `BATCH\n agency\|name1\|name2\|doc\|date\|number\n...` | Cliente → Servidor | `ACK\|OK` o `ACK\|FAIL` |
 | END | `END\|agency_id` | Cliente → Servidor | `ACK\|OK` |
-| QUERY | `QUERY\|agency_id` | Cliente → Servidor | `WINNERS\|count\|dni1,dni2,...` o `ACK\|WAIT` |
+| QUERY | `QUERY\|agency_id` | Cliente → Servidor | `WINNERS\|count\|dni1,dni2,...` |
 
 ---
 
@@ -126,9 +115,10 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 4. **Envía batches en loop** por la misma conexión
    - Espera `ACK|OK/FAIL` antes del siguiente
 5. **Notifica END** → `END|agency_id`
-6. **Consulta ganadores** en loop con backoff:
-   - Si `ACK|WAIT` → duerme 100ms, 200ms, 400ms... (max 2s)
-   - Si `WINNERS|...` → parsea y termina
+   - El cliente queda bloqueado en `ReadFrame` esperando el `ACK|OK`
+   - Del otro lado, el servidor está bloqueado en `barrier.wait()` hasta que todas las agencias enviaron su END
+   - Una vez que el sorteo termina, la barrera libera al servidor, que envía el `ACK|OK` y desbloquea al cliente
+6. **Consulta ganadores** → recibe `WINNERS|...` directamente (sorteo ya realizado)
 7. **Cierra conexión** (`conn.Close()`)
 
 **SIGTERM Handling**:
@@ -137,7 +127,7 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 - Cierra socket cuello limpio
 
 **Batching Dinámico**: 
-- El cliente ya no solo corta por `maxAmount` (80 apuestas). Ahora implementa un cálculo dinámico de bytes en tiempo real. Si el acumulado de apuestas más el encabezado `BATCH\n` alcanza los `8kB (MaxPayloadSize)`, el cliente cierra el batch y lo envía, garantizando que nunca se viole el límite del protocolo.
+- El cliente no solo corta por `maxAmount` (80 apuestas), sino que implementa un cálculo dinámico de bytes en tiempo real. Si el acumulado de apuestas más el encabezado `BATCH\n` alcanza los `8kB (MaxPayloadSize)`, el cliente cierra el batch y lo envía, garantizando que nunca se viole el límite del protocolo.
 
 ---
 
@@ -167,52 +157,40 @@ while self._running:
 - Responde `ACK|OK` o `ACK|FAIL`
 
 **`__handle_end()`**:
-- Marca agencia en `finished_agencies[agency] = 1`
-- Si es la última agencia:
-  - Adquiere `sorteo_lock` (double-check locking)
-  - Si no ejecutado aún: `__run_winners_by_agency()`
-  - Activa `sorteo_realizado = True`
-  - Loguea: `action: sorteo | result: success`
+- Llama `barrier.wait()` → bloquea hasta que todas las N agencias llegaron
+- El último proceso en llegar ejecuta `__run_winners_by_agency()` (action de la barrera), mientras los demás siguen bloqueados
+- Una vez que el sorteo termina, la barrera libera a todos
 - Responde `ACK|OK`
 
 **`__handle_query()`**:
-- Si `not sorteo_realizado.value`: responde `ACK|WAIT`
-- Si completado: responde `WINNERS|count|dni1,dni2,...`
+- El proceso ya pasó la barrera.
+- Responde `WINNERS|count|dni1,dni2,...` directamente
 - Loguea cantidad de ganadores
 
 #### Shared State (via `multiprocessing.Manager()`)
 
 | Variable | Tipo | Propósito |
 |----------|------|---------|
-| `finished_agencies` | dict | `agency_id → 1` (tracking de quién terminó) |
-| `winners_by_agency` | dict | `agency_id → [dni1, dni2, ...]` (cache) |
+| `winners_by_agency` | dict | `agency_id → [dni1, dni2, ...]` (cache de resultados) |
 | `bets_lock` | Lock | Protege `store_bets()` |
-| `sorteo_lock` | Lock | Protege sección crítica del sorteo |
-| `sorteo_realizado` | Value('b') | Flag atómico (False/True) |
+| `barrier` | Barrier(N) | Sincroniza los N workers; su `action` corre el sorteo exactamente una vez |
 
 
 ### Mecanismos de sincronización en el servidor
 
-El servidor usa `multiprocessing.Manager()` para compartir estado entre procesos hijos. Esto evita race conditions sobre memoria compartida y permite que cada worker acceda ordenado a los datos.
-- `self._bets_lock` (Lock)
-  - Protege tanto la escritura (`store_bets`) como la lectura del sorteo (`load_bets`).
+- `self._bets_lock` (Manager.Lock)
+  - Protege escrituras concurrentes a `store_bets()`.
 
-- `self._finished_agencies` (Manager.dict)
-  - Marca qué agencias recibieron su `END`.
-  - Se usa para saber si se puede disparar el sorteo.
-  - Guardamos `agency` como string por consistencia con keys en `winners_by_agency`.
+- `self._barrier` (multiprocessing.Barrier(N, action=__run_winners_by_agency))
+  - Cada proceso llama `barrier.wait()` al recibir el END de su agencia.
+  - La barrera bloquea a todos hasta que los N procesos llegaron.
+  - El último en llegar ejecuta el `action` (sorteo) mientras los demás permanecen bloqueados.
+  - Una vez que el sorteo termina, todos los procesos son liberados simultáneamente.
+  - Esto garantiza que ningún proceso responda una QUERY antes de que los resultados estén listos, sin necesidad de locks ni flags adicionales.
+  - En shutdown, el padre llama `barrier.abort()` para desbloquear procesos que estén esperando, causando `BrokenBarrierError` que los hijos capturan y manejan.
 
-- `self._sorteo_lock` (Lock) + `self._sorteo_realizado` (Value('b'))
-  - `sorteo_lock` protege la sección crítica donde se calcula una sola vez el sorteo.
-  - Patrón double-check:
-    1. Si `len(finished_agencies) == expected`, intenta entrar al lock.
-    2. Dentro del lock, chequear `if not self._sorteo_realizado.value`.
-    3. Si sigue falso, correr `__run_winners_by_agency`, luego `self._sorteo_realizado.value=True`.
-  - Esto evita que dos procesos (caso de END concurrentes) ejecuten sorteo al mismo tiempo o más de una vez.
-
-- `self._winners_by_agency` (Manager.dict) (cache de resultados)
-  - Mapa de agency -> lista de DNI ganadores.
-  - Se construye en `__run_winners_by_agency()` usando dict local y luego asigando por agencia para evitar problemas de `append` en listas compartidas.
+- `self._winners_by_agency` (Manager.dict)
+  - Poblado dentro del `action` de la barrera usando un dict local para evitar problemas con `append` en listas compartidas de Manager.
 
 - `signal.signal(signal.SIGTERM, signal.SIG_IGN)` en cada proceso hijo
   - Los hijos ignoran SIGTERM y evitan ejecutar `__shutdown()` individualmente.

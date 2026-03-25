@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/7574-sistemas-distribuidos/docker-compose-init/client/protocol"
 	"github.com/op/go-logging"
@@ -105,51 +104,39 @@ func (c *Client) notifyFinished() error {
 }
 
 func (c *Client) queryWinners(stop <-chan struct{}) (int, error) {
-	waitTime := 100 * time.Millisecond
-	for {
-		select {
-		case <-stop:
-			return 0, fmt.Errorf("client stopped")
-		default:
-		}
-
-		message := QueryMsgType + "|" + c.config.ID
-		err := protocol.WriteFrame(c.conn, []byte(message))
-		if err != nil {
-			return 0, err
-		}
-
-		resp, err := protocol.ReadFrame(c.conn)
-		if err != nil {
-			return 0, err
-		}
-
-		respStr := string(resp)
-		if respStr == protocol.ExpectedACKWait {
-			time.Sleep(waitTime)
-			// Exponential backoff: dobla el tiempo, máximo 2 segundos
-			if waitTime < 2*time.Second {
-				waitTime *= 2
-			}
-			continue
-		}
-
-		if !strings.HasPrefix(respStr, WinnersMsgType+"|") {
-			return 0, fmt.Errorf("invalid QUERY response")
-		}
-
-		parts := strings.SplitN(respStr, "|", 3)
-		if len(parts) < 2 {
-			return 0, fmt.Errorf("invalid winners payload")
-		}
-
-		count, err := strconv.Atoi(parts[1])
-		if err != nil {
-			return 0, err
-		}
-
-		return count, nil
+	select {
+	case <-stop:
+		return 0, fmt.Errorf("client stopped")
+	default:
 	}
+
+	message := QueryMsgType + "|" + c.config.ID
+	err := protocol.WriteFrame(c.conn, []byte(message))
+	if err != nil {
+		return 0, err
+	}
+
+	resp, err := protocol.ReadFrame(c.conn)
+	if err != nil {
+		return 0, err
+	}
+
+	respStr := string(resp)
+	if !strings.HasPrefix(respStr, WinnersMsgType+"|") {
+		return 0, fmt.Errorf("invalid QUERY response")
+	}
+
+	parts := strings.SplitN(respStr, "|", 3)
+	if len(parts) < 2 {
+		return 0, fmt.Errorf("invalid winners payload")
+	}
+
+	count, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, err
+	}
+
+	return count, nil
 }
 
 func (c *Client) sendBatches(stop <-chan struct{}) error {

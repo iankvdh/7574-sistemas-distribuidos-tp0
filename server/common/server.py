@@ -6,7 +6,7 @@ import os
 
 from common.bet_message import BatchParseError, parse_batch_message, parse_end_message, parse_query_message, BATCH_MSG_TYPE, END_MSG_TYPE, QUERY_MSG_TYPE, WINNERS_MSG_TYPE
 from common.utils import has_won, load_bets, store_bets, STORAGE_FILEPATH
-from protocol.protocol import read_frame, write_frame, ACK_OK, ACK_FAIL, ACK_WAIT
+from protocol.protocol import read_frame, write_frame, ACK_OK, ACK_FAIL
 
 
 class Server:
@@ -25,11 +25,12 @@ class Server:
         
         # Estado compartido usando multiprocessing.Manager()
         self._manager = multiprocessing.Manager()
-        self._finished_agencies = self._manager.dict()  # agencia -> 1 (solo para saber si ya terminó)
-        self._winners_by_agency = self._manager.dict() # agencia -> [dni...]
+        self._winners_by_agency = self._manager.dict()  # agencia -> [dni...]
         self._bets_lock = self._manager.Lock()  # Lock para store_bets()
-        self._sorteo_lock = self._manager.Lock()  # Lock para proteger sección crítica del sorteo
-        self._sorteo_realizado = self._manager.Value('b', False)  # Flag (ya se hizo o no)
+
+        # Barrera que sincroniza los N procesos hijos. Cuando todos llegaron (END recibido),
+        # ejecuta el sorteo exactamente una vez (action) y recién ahí los libera a todos.
+        self._barrier = multiprocessing.Barrier(agencies_expected, action=self.__run_winners_by_agency)
 
     def _handle_sigterm(self):
         logging.info("action: shutdown | result: in_progress | signal: SIGTERM")
@@ -166,22 +167,17 @@ class Server:
 
     def __handle_end(self, client_sock, msg):
         """
-        Handle END message: mark agency as finished, trigger draw if all agencies done.
+        Handle END message: wait at barrier until all agencies are done, then ACK.
+
+        barrier.wait() blocks until all N agencies call it. The last one triggers
+        the action (sorteo). Only after the action completes are all processes released.
         """
         try:
-            agency = str(parse_end_message(msg))
-            
-            # Marcamos la agencia como finalizada
-            self._finished_agencies[agency] = 1
-            
-            if len(self._finished_agencies) == self._agencies_expected:
-                with self._sorteo_lock:
-                    if not self._sorteo_realizado.value: 
-                        self.__run_winners_by_agency()
-                    self._sorteo_realizado.value = True
-                    logging.info("action: sorteo | result: success")
-            
+            parse_end_message(msg)
+            self._barrier.wait()
             write_frame(client_sock, ACK_OK)
+        except multiprocessing.BrokenBarrierError:
+            logging.info("action: fin_envio | result: interrupted | reason: shutdown")
         except Exception as e:
             logging.info(f"action: fin_envio | result: fail | error: {e}")
             try:
@@ -191,16 +187,13 @@ class Server:
 
     def __handle_query(self, client_sock, msg):
         """
-        Handle QUERY message: return winners if draw is complete, else WAIT.
+        Handle QUERY message: return winners for the requesting agency.
+
+        By the time a QUERY arrives, the process already passed barrier.wait() in
+        __handle_end, so the sorteo is guaranteed to be complete.
         """
         try:
-            agency = str(parse_query_message(msg))  # Asegurar string como clave
-            
-            # Si todavía no se hizo el sorteo, decimos que espere
-            if not self._sorteo_realizado.value:
-                write_frame(client_sock, ACK_WAIT)
-                return
-            
+            agency = str(parse_query_message(msg))
             winners = self._winners_by_agency.get(agency, [])
             winners_payload = "{}|{}|{}".format(
                 WINNERS_MSG_TYPE,
@@ -222,21 +215,16 @@ class Server:
 
     def __run_winners_by_agency(self):
         """
-        Computes winners grouped by agency.
+        Computes winners grouped by agency (runs as barrier action).
 
-        Loads all stored bets, evaluates which bets have won, and builds
-        an in-memory mapping in the shared state:
+        Called exactly once by the last process to reach the barrier, while all
+        other processes remain blocked. Populates winners_by_agency before
+        any process is released.
 
-            agency -> list of winner document IDs
-        
-        This method is called ONLY ONCE when all agencies have notified
-        that they finished sending bets.
-        
         NOTE: We use a local dict to collect winners and then assign to the
         shared Manager dict, because nested lists in Manager dicts have
         synchronization issues when using .append() across processes.
         """
-        # Juntamos ganadores en un dict local
         local_winners = {}
         bets = list(load_bets())
         for bet in bets:
@@ -249,12 +237,20 @@ class Server:
         for agency, winners_list in local_winners.items():
             self._winners_by_agency[agency] = winners_list
 
+        logging.info("action: sorteo | result: success")
+
     def __shutdown(self, timeout=5):
         """
         Graceful shutdown: terminate child processes, cleanup Manager, and close server socket.
         """
         logging.info("action: shutdown | result: in_progress")
-        
+
+        # Abortamos la barrera para desbloquear procesos hijos que estén esperando en barrier.wait()
+        try:
+            self._barrier.abort()
+        except Exception:
+            pass
+
         # Terminamos todos los procesos hijos
         for process in self._child_processes:
             if process.is_alive():
