@@ -46,6 +46,7 @@ Modificar el servidor para que permita aceptar conexiones y procesar mensajes en
   - Consultar ganadores
 - Cierra conexión al final (`conn.Close()`).
 - **Ventaja**: Eliminamos overhead de repetidas conexiones TCP.
+- **Lectura streaming**: El CSV se lee línea por línea, nunca se carga todo en memoria.
 
 **Servidor**:
 - Usa `multiprocessing.Process` para que **cada cliente tenga su propio proceso hijo**.
@@ -72,18 +73,19 @@ Si en el futuro el entorno objetivo usa de forma estable Python sin GIL, una sol
 
 
 
-### Signal Handling para Procesos Hijo
+### Graceful Shutdown
 
-**Cambio**: Los procesos hijo ahora ignoran SIGTERM (al inicio de `__handle_client_connection`):
-```python
-signal.signal(signal.SIGTERM, signal.SIG_IGN)
-```
+**Servidor**:
+- Handler de SIGTERM cierra el socket del servidor para desbloquear `accept()`
+- En shutdown:
+  1. Aborta la barrera (`barrier.abort()`)
+  2. Cierra sockets de clientes (desbloquea `read_frame()` en hijos)
+  3. Envía SIGTERM a hijos via `terminate()` (NO usa `kill()`)
+  4. Espera con timeout
 
-**Por qué**: 
-- Docker envía SIGTERM a todos los procesos del contenedor.
-- Sin esta línea, los procesos hijo herederían el handler del padre y intentarían ejecutar `__shutdown()`.
-- Resultado: múltiples procesos cerrando Manager, matando procesos ajenos, etc.
-- Ahora: solo el padre maneja shutdown, los hijos mueren limpiamente.
+**Cliente**:
+- Goroutine que escucha SIGTERM
+- Cierra conexión y notifica al loop principal via channel
 
 ---
 
@@ -91,11 +93,11 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 ### Protocolo de Comunicación
 
-**Framing binario** (sin cambios del Ejercicio 7):
+**Framing binario**:
 ```
 [2 bytes big-endian: len(payload)][payload string UTF-8]
 ```
-**MTU**: Se definió un límite estricto de `8kB (MaxPayloadSize)` bytes por frame (tanto el emisor como el receptor validan el tamaño del payload)
+**MTU**: Se definió un límite de `8kB` bytes por frame (configurable via `protocol.maxPayloadSize` en config.yaml)
 
 **Mensajes**:
 | Tipo | Formato | Dirección | Respuesta |
@@ -109,9 +111,9 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 ### Cliente
 
 **Flujo**:
-1. **Carga apuestas** desde CSV `/data/agency-{ID}.csv` y mapea a estructuras Bet.
+1. **Abre canal streaming** desde CSV `/data/agency-{ID}.csv`
 2. **Abre TCP una sola vez** → `net.Dial("tcp", serverAddr)`
-3. **Divide en batches** (tamaño configurable y dinámico)
+3. **Consume apuestas del channel y arma batches** (tamaño configurable y dinámico)
 4. **Envía batches en loop** por la misma conexión
    - Espera `ACK|OK/FAIL` antes del siguiente
 5. **Notifica END** → `END|agency_id`
@@ -121,13 +123,8 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 6. **Consulta ganadores** → recibe `WINNERS|...` directamente (sorteo ya realizado)
 7. **Cierra conexión** (`conn.Close()`)
 
-**SIGTERM Handling**:
-- Goroutine que escucha `syscall.SIGTERM`
-- Activa canal `stop` para interrumpir loops
-- Cierra socket cuello limpio
-
 **Batching Dinámico**: 
-- El cliente no solo corta por `maxAmount` (80 apuestas), sino que implementa un cálculo dinámico de bytes en tiempo real. Si el acumulado de apuestas más el encabezado `BATCH\n` alcanza los `8kB (MaxPayloadSize)`, el cliente cierra el batch y lo envía, garantizando que nunca se viole el límite del protocolo.
+- El cliente no solo corta por `maxAmount` (apuestas), sino que implementa un cálculo dinámico de bytes en tiempo real. Si el acumulado de apuestas más el encabezado `BATCH\n` alcanza el `MaxPayloadSize`, el cliente cierra el batch y lo envía.
 
 ---
 
@@ -136,18 +133,19 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 #### Main Loop (`run()`)
 ```
 while self._running:
-    client_sock, addr = accept()
+    client_sock, addr = accept()  # Bloqueante, sin timeout
+    self._client_sockets.append(client_sock)
     Process(target=__handle_client_connection, args=(client_sock, addr))
     cada 5 conexiones → limpiar procesos muertos
 ```
 
-**Timeout del socket**: 1 segundo (para que SIGTERM sea responsive)
+**Sin timeout**: El socket se cierra desde el handler de SIGTERM para desbloquear.
 
 #### Worker Process (`__handle_client_connection`)
 - Corre en **proceso separado** 
 - Ignora SIGTERM (solo padre maneja)
 - Loop infinito: `frame = read_frame(socket)` → dispatch handlers
-- Cierra socket si error o EOF
+- Cierra socket si error o EOF (incluyendo cierre por el padre en shutdown)
 
 #### Handlers
 
@@ -192,9 +190,31 @@ while self._running:
 - `self._winners_by_agency` (Manager.dict)
   - Poblado dentro del `action` de la barrera usando un dict local para evitar problemas con `append` en listas compartidas de Manager.
 
-- `signal.signal(signal.SIGTERM, signal.SIG_IGN)` en cada proceso hijo
-  - Los hijos ignoran SIGTERM y evitan ejecutar `__shutdown()` individualmente.
-  - El padre recibe SIGTERM, pone `_running=False`, y hace `__shutdown()` sincronizado.
+- **Cierre de sockets de clientes en shutdown**
+  - El padre mantiene lista de sockets de clientes (`self._client_sockets`)
+  - En shutdown, cierra estos sockets con `shutdown()` + `close()`
+  - Esto desbloquea a los hijos que están esperando en `read_frame()`
+  - Los hijos detectan el cierre (OSError) y terminan limpiamente
+
+---
+
+## Configuración
+
+### Cliente (`config.yaml`)
+```yaml
+server:
+  address: "server:12345"
+batch:
+  maxAmount: 10
+protocol:
+  maxPayloadSize: 8192  # Tamaño máximo de payload en bytes
+log:
+  level: "INFO"
+```
+
+### Servidor
+- `AGENCIES_EXPECTED`: Número de agencias esperadas (para la barrera)
+- `MAX_PAYLOAD_SIZE`: se podría agregar la variable de entorno para configurar esto en el protocolo del lado del server también
 
 ---
 

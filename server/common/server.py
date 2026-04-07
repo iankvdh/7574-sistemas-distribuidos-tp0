@@ -22,6 +22,7 @@ class Server:
         self._running = True
         self._agencies_expected = agencies_expected
         self._child_processes = []
+        self._client_sockets = []  # Referencias a sockets de clientes para cerrarlos en shutdown
         
         # Estado compartido usando multiprocessing.Manager()
         self._manager = multiprocessing.Manager()
@@ -32,10 +33,18 @@ class Server:
         # ejecuta el sorteo exactamente una vez (action) y recién ahí los libera a todos.
         self._barrier = multiprocessing.Barrier(agencies_expected, action=self.__run_winners_by_agency)
 
-    def _handle_sigterm(self):
+    def _handle_sigterm(self, signum, frame):
+        """
+        Handler de SIGTERM: marca running=False y cierra el socket del servidor
+        para desbloquear el accept() en el main loop.
+        """
         logging.info("action: shutdown | result: in_progress | signal: SIGTERM")
         self._running = False
-        self.__shutdown(timeout=5)
+        # Cerrar el socket del servidor para desbloquear accept()
+        try:
+            self._server_socket.close()
+        except OSError:
+            pass
 
     def run(self):
         """
@@ -43,12 +52,12 @@ class Server:
 
         Accepts client connections and spawns a new process for each client.
         Each child process handles the persistent client connection.
+        
+        El loop principal NO usa timeout. El socket se cierra desde _handle_sigterm
+        para desbloquear el accept() cuando llega SIGTERM.
         """
         # Handle SIGTERM signal
         signal.signal(signal.SIGTERM, self._handle_sigterm)
-        
-        # Le ponemos un timeout al socket así el accept() no queda colgado eternamente y se revisa nuevamente el flag de self._running
-        self._server_socket.settimeout(1)
 
         while self._running:
             try:
@@ -64,6 +73,9 @@ class Server:
                 client_sock, addr = self._server_socket.accept()
                 logging.info(f'action: accept_connections | result: success | ip: {addr[0]}')
                 
+                # Guardamos referencia al socket para poder cerrarlo en shutdown
+                self._client_sockets.append(client_sock)
+                
                 # Levantamos un proceso nuevo para manejar al cliente
                 process = multiprocessing.Process(
                     target=self.__handle_client_connection,
@@ -72,16 +84,14 @@ class Server:
                 process.start()
                 self._child_processes.append(process)
                 
-            except socket.timeout:
-                # Timeout, check self._running
-                continue
             except OSError as e:
+                # Socket cerrado por shutdown o error
                 if self._running:
                     logging.error(f"action: accept_connections | result: fail | error: {e}")
                 break
 
         # Graceful shutdown
-        self.__shutdown(timeout=5)
+        self.__shutdown(timeout=10)
 
     def __handle_client_connection(self, client_sock, client_ip):
         """
@@ -225,51 +235,74 @@ class Server:
         shared Manager dict, because nested lists in Manager dicts have
         synchronization issues when using .append() across processes.
         """
-        local_winners = {}
-        bets = list(load_bets())
-        for bet in bets:
-            if has_won(bet):
-                agency = str(bet.agency)
-                if agency not in local_winners:
-                    local_winners[agency] = []
-                local_winners[agency].append(str(bet.document))
+
+        # Aunque la barrera garantiza que solo uno entra acá, el Lock 
+        # explicita la protección del recurso compartido (STORAGE y winners_by_agency)
+        with self._bets_lock:
+            local_winners = {}
+            bets = list(load_bets())
+            for bet in bets:
+                if has_won(bet):
+                    agency = str(bet.agency)
+                    if agency not in local_winners:
+                        local_winners[agency] = []
+                    local_winners[agency].append(str(bet.document))
+            
+            for agency, winners_list in local_winners.items():
+                self._winners_by_agency[agency] = winners_list
+
+            logging.info("action: sorteo | result: success")
+
+    def __shutdown(self, timeout=10):
+        """
+        Graceful shutdown: cierra sockets de clientes, termina procesos hijos, cleanup Manager.
         
-        for agency, winners_list in local_winners.items():
-            self._winners_by_agency[agency] = winners_list
-
-        logging.info("action: sorteo | result: success")
-
-    def __shutdown(self, timeout=5):
+        El flujo de shutdown es:
+        1. Abortar la barrera para desbloquear procesos esperando en barrier.wait()
+        2. Cerrar sockets de clientes para desbloquear procesos esperando en read_frame()
+        3. Enviar SIGTERM a procesos hijos (via terminate())
+        4. Esperar a que terminen
+        5. NO usamos kill() - si un proceso no responde, lo logueamos pero no forzamos
         """
-        Graceful shutdown: terminate child processes, cleanup Manager, and close server socket.
-        """
-        logging.info("action: shutdown | result: in_progress")
 
-        # Abortamos la barrera para desbloquear procesos hijos que estén esperando en barrier.wait()
+        # 1. Abortamos la barrera para desbloquear procesos hijos que estén esperando en barrier.wait()
         try:
             self._barrier.abort()
         except Exception:
             pass
 
-        # Terminamos todos los procesos hijos
+        # 2. Cerramos los sockets de clientes para desbloquear hijos que estén en read_frame()
+        for client_sock in self._client_sockets:
+            try:
+                client_sock.shutdown(socket.SHUT_RDWR)
+                client_sock.close()
+            except OSError:
+                pass
+        self._client_sockets.clear()
+
+        # 3. Terminamos todos los procesos hijos (envía SIGTERM)
         for process in self._child_processes:
             if process.is_alive():
                 process.terminate()
         
-        # Esperamos un poco a que mueran
+        # 4. Esperamos a que mueran
         for process in self._child_processes:
             process.join(timeout)
             if process.is_alive():
-                # Si sigue vivo, lo matamos de una
-                process.kill()
-                process.join()
+                # Si sigue vivo después del timeout, lo logueamos pero NO usamos kill()
+                # El proceso eventualmente morirá cuando el container se detenga
+                logging.warning(f"action: process_termination | result: timeout | pid: {process.pid}")
         
-        # Cerramos el socket del server
+        # 5. Limpiamos la lista de procesos
+        self._child_processes.clear()
+        
+        # 6. Cerramos el socket del server (ya debería estar cerrado por _handle_sigterm)
         try:
             self._server_socket.close()
         except OSError:
             pass
         
+        # 7. Shutdown del manager
         try:
             self._manager.shutdown()
         except Exception as e:

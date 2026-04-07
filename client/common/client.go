@@ -24,17 +24,17 @@ type ClientConfig struct {
 
 // Client Entity that encapsulates how
 type Client struct {
-	config ClientConfig
-	conn   net.Conn
-	bets   []Bet
+	config   ClientConfig
+	conn     net.Conn
+	betsChan <-chan BetOrError
 }
 
 // NewClient Initializes a new client receiving the configuration
-// as a parameter
-func NewClient(config ClientConfig, bets []Bet) *Client {
+// as a parameter. Recibe un channel de streaming de apuestas.
+func NewClient(config ClientConfig, betsChan <-chan BetOrError) *Client {
 	client := &Client{
-		config: config,
-		bets:   bets,
+		config:   config,
+		betsChan: betsChan,
 	}
 	return client
 }
@@ -144,14 +144,18 @@ func (c *Client) sendBatches(stop <-chan struct{}) error {
 	currentBatch := make([]Bet, 0, c.config.BatchMaxAmount)
 	currentBytes := batchHeaderSize
 
-	for i := 0; i < len(c.bets); i++ {
+	for betOrErr := range c.betsChan {
 		select {
 		case <-stop:
 			return fmt.Errorf("client stopped")
 		default:
 		}
 
-		bet := c.bets[i]
+		if betOrErr.Err != nil {
+			return betOrErr.Err
+		}
+
+		bet := betOrErr.Bet
 		betSize := len(bet.ToRow()) + 1 // +1 para el \n
 
 		// Chequeamos que una apuesta individual (más encabezado) no exceda el MaxPayloadSize bytes

@@ -4,6 +4,24 @@ En el presente repositorio se provee un esqueleto básico de cliente/servidor, e
 
  El cliente (Golang) y el servidor (Python) fueron desarrollados en diferentes lenguajes simplemente para mostrar cómo dos lenguajes de programación pueden convivir en el mismo proyecto con la ayuda de containers, en este caso utilizando [Docker Compose](https://docs.docker.com/compose/).
 
+## Criterios de aprobación:
+### Implica desaprobación:
+- No implementar un protocolo de comunicación, cualquiera sea este.
+- No implementar una solución multithreading o multiprocessing para asegurar la
+escalabilidad en los ejercicios requeridos.
+- Usar bibliotecas para resolver la comunicación en lugar de sockets.
+- Usar bibliotecas para serializar los paquetes de comunicación (ej. JSON)
+- No efectuar un correcto manejo de envío y recepción de paquetes.
+### Implica observación o quita de puntos:
+- Diseñar un protocolo poco claro u ordenado. Puede ser un protocolo complejo
+pero tiene que mantener coherencia consigo mismo y con el enunciado.
+- Optar por otros IPCs aparte de Sockets, FileLocks o BlockingQueues para
+sincronizar, si es que la implementación resulta confusa o poco mantenible.
+- No optimizar la lectura y escritura durante el almacenamiento de datos
+considerando su particionamiento, cuando sea posible.
+
+
+
 ## Instrucciones de uso
 El repositorio cuenta con un **Makefile** que incluye distintos comandos en forma de targets. Los targets se ejecutan mediante la invocación de:  **make \<target\>**. Los target imprescindibles para iniciar y detener el sistema son **docker-compose-up** y **docker-compose-down**, siendo los restantes targets de utilidad para el proceso de depuración.
 

@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/7574-sistemas-distribuidos/docker-compose-init/client/common"
+	"github.com/7574-sistemas-distribuidos/docker-compose-init/client/protocol"
 )
 
 var log = logging.MustGetLogger("log")
@@ -36,6 +37,7 @@ func InitConfig() (*viper.Viper, error) {
 	v.BindEnv("log", "level")
 	v.BindEnv("batch.maxAmount")
 	v.BindEnv("agency.file", "CLI_AGENCY_FILE")
+	v.BindEnv("protocol.maxPayloadSize")
 
 	// Try to read configuration from config file. If config file
 	// does not exists then ReadInConfig will fail but configuration
@@ -74,12 +76,13 @@ func InitLogger(logLevel string) error {
 // PrintConfig Print all the configuration parameters of the program.
 // For debugging purposes only
 func PrintConfig(v *viper.Viper) {
-	log.Infof("action: config | result: success | client_id: %s | server_address: %s | log_level: %s | batch_max_amount: %d | agency_file: %s",
+	log.Infof("action: config | result: success | client_id: %s | server_address: %s | log_level: %s | batch_max_amount: %d | agency_file: %s | protocol_max_payload_size: %d",
 		v.GetString("id"),
 		v.GetString("server.address"),
 		v.GetString("log.level"),
 		v.GetInt("batch.maxAmount"),
 		v.GetString("agency.file"),
+		v.GetInt("protocol.maxPayloadSize"),
 	)
 }
 
@@ -107,6 +110,12 @@ func main() {
 	// Print program config with debugging purposes
 	PrintConfig(v)
 
+	// Configurar MaxPayloadSize desde config.yaml (si se definió)
+	maxPayloadSize := v.GetInt("protocol.maxPayloadSize")
+	if maxPayloadSize > 0 {
+		protocol.SetMaxPayloadSize(maxPayloadSize)
+	}
+
 	clientConfig := common.ClientConfig{
 		ServerAddress:  v.GetString("server.address"),
 		ID:             v.GetString("id"),
@@ -118,14 +127,14 @@ func main() {
 	}
 
 	agencyFile := resolveAgencyFile(v)
-	bets, err := common.LoadBetsFromCSV(agencyFile, clientConfig.ID)
+	betsChan, err := common.LoadBetsFromCSVStreaming(agencyFile, clientConfig.ID)
 	if err != nil {
 		log.Criticalf("action: load_bets | result: fail | client_id: %s | error: %v", clientConfig.ID, err)
 		return
 	}
 
-	log.Infof("action: load_bets | result: success | client_id: %s | cantidad: %d", clientConfig.ID, len(bets))
+	log.Infof("action: load_bets | result: success | client_id: %s | file: %s", clientConfig.ID, agencyFile)
 
-	client := common.NewClient(clientConfig, bets)
+	client := common.NewClient(clientConfig, betsChan)
 	client.StartClient()
 }

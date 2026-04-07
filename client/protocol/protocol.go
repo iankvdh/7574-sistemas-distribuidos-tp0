@@ -10,8 +10,19 @@ const (
 	ExpectedACK     = "ACK|OK"
 	ExpectedNACK    = "ACK|FAIL"
 	ExpectedACKWait = "ACK|WAIT"
-	MaxPayloadSize  = 8192
 )
+
+// MaxPayloadSize es el tamaño máximo de payload en bytes.
+// Es configurable desde config.yaml (protocol.maxPayloadSize).
+// Default: 8192 (8KB)
+var MaxPayloadSize = 8192
+
+// SetMaxPayloadSize permite configurar el tamaño máximo de payload.
+func SetMaxPayloadSize(size int) {
+	if size > 0 {
+		MaxPayloadSize = size
+	}
+}
 
 // WriteFrame escribe un frame en conexión con el formato:
 // 2 bytes size (uint16 big-endian)][payload]
