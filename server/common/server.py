@@ -8,13 +8,22 @@ from common.bet_message import BatchParseError, parse_batch_message, parse_end_m
 from common.utils import has_won, load_bets, store_bets, STORAGE_FILEPATH
 from protocol.protocol import read_frame, write_frame, ACK_OK, ACK_FAIL
 
+WINNERS_DIR = "./winners"
+
 
 class Server:
     def __init__(self, port, listen_backlog, agencies_expected):
         # borramos el archivo de apuestas al iniciar el servidor para empezar limpio cada vez
         if os.path.exists(STORAGE_FILEPATH):
             os.remove(STORAGE_FILEPATH)
-        
+
+        # borramos archivos de ganadores de corridas anteriores
+        if os.path.exists(WINNERS_DIR):
+            for f in os.listdir(WINNERS_DIR):
+                os.remove(os.path.join(WINNERS_DIR, f))
+        else:
+            os.makedirs(WINNERS_DIR)
+
         # Initialize server socket
         self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_socket.bind(('', port))
@@ -23,10 +32,9 @@ class Server:
         self._agencies_expected = agencies_expected
         self._child_processes = []
         self._client_sockets = []  # Referencias a sockets de clientes para cerrarlos en shutdown
-        
+
         # Estado compartido usando multiprocessing.Manager()
         self._manager = multiprocessing.Manager()
-        self._winners_by_agency = self._manager.dict()  # agencia -> [dni...]
         self._bets_lock = self._manager.Lock()  # Lock para store_bets()
 
         # Barrera que sincroniza los N procesos hijos. Cuando todos llegaron (END recibido),
@@ -52,7 +60,7 @@ class Server:
 
         Accepts client connections and spawns a new process for each client.
         Each child process handles the persistent client connection.
-        
+
         El loop principal NO usa timeout. El socket se cierra desde _handle_sigterm
         para desbloquear el accept() cuando llega SIGTERM.
         """
@@ -63,19 +71,14 @@ class Server:
             try:
                 # Cada 5 conexiones nuevas, realizamos una limpieza de la lista de procesos
                 if len(self._child_processes) % 5 == 0:
-                    procesos_activos = []
-                    for p in self._child_processes:
-                        if p.is_alive():
-                            procesos_activos.append(p)
-                    self._child_processes = procesos_activos
-                
+                    self._child_processes = [p for p in self._child_processes if p.is_alive()]
 
                 client_sock, addr = self._server_socket.accept()
                 logging.info(f'action: accept_connections | result: success | ip: {addr[0]}')
-                
+
                 # Guardamos referencia al socket para poder cerrarlo en shutdown
                 self._client_sockets.append(client_sock)
-                
+
                 # Levantamos un proceso nuevo para manejar al cliente
                 process = multiprocessing.Process(
                     target=self.__handle_client_connection,
@@ -83,7 +86,7 @@ class Server:
                 )
                 process.start()
                 self._child_processes.append(process)
-                
+
             except OSError as e:
                 # Socket cerrado por shutdown o error
                 if self._running:
@@ -101,16 +104,17 @@ class Server:
         BATCH -> END -> QUERY. This handler reads messages in a loop
         until the client disconnects or an error occurs.
         """
-        # El proceso hijo ignora SIGTERM, así el shutdown lo maneja solo el proceso padre
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        
+        # El proceso hijo restaura el handler por defecto de SIGTERM para que
+        # el terminate() del padre funcione como fallback de último recurso.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
         try:
             while True:
                 try:
                     frame = read_frame(client_sock)
                     if not frame:  # El cliente se fue bien
                         break
-                    
+
                     msg = frame.decode('utf-8')
                     logging.info(f'action: receive_message | result: success | ip: {client_ip}')
 
@@ -122,14 +126,14 @@ class Server:
                         self.__handle_query(client_sock, msg)
                     else:
                         raise ValueError("unsupported message payload")
-                        
+
                 except socket.timeout:
                     # Timeout del socket → cortamos la conexión
                     break
                 except OSError:
                     # Socket cerrado o error de I/O → salimos
                     break
-                    
+
         except Exception as e:
             logging.error(f"action: client_connection | result: fail | ip: {client_ip} | error: {e}")
         finally:
@@ -153,23 +157,19 @@ class Server:
                 store_bets(bets)
             finally:
                 self._bets_lock.release()
-            
+
             logging.info(f"action: apuesta_recibida | result: success | cantidad: {batch_count}")
             write_frame(client_sock, ACK_OK)
 
         except BatchParseError as e:
             batch_count = e.count
-            logging.info(
-                f"action: apuesta_recibida | result: fail | cantidad: {batch_count}"
-            )
+            logging.info(f"action: apuesta_recibida | result: fail | cantidad: {batch_count}")
             try:
                 write_frame(client_sock, ACK_FAIL)
             except OSError:
                 pass
         except Exception as e:
-            logging.info(
-                f"action: apuesta_recibida | result: fail | cantidad: {batch_count} | error: {e}"
-            )
+            logging.info(f"action: apuesta_recibida | result: fail | cantidad: {batch_count} | error: {e}")
             try:
                 write_frame(client_sock, ACK_FAIL)
             except OSError:
@@ -197,23 +197,33 @@ class Server:
 
     def __handle_query(self, client_sock, msg):
         """
-        Handle QUERY message: return winners for the requesting agency.
+        Handle QUERY message: stream winners file for the requesting agency.
 
         By the time a QUERY arrives, the process already passed barrier.wait() in
-        __handle_end, so the sorteo is guaranteed to be complete.
+        __handle_end, so the sorteo is guaranteed to be complete and the winners
+        file is already written.
         """
         try:
             agency = str(parse_query_message(msg))
-            winners = self._winners_by_agency.get(agency, [])
+            winners_file = os.path.join(WINNERS_DIR, f"winners_{agency}.txt")
+
+            dnis = []
+            if os.path.exists(winners_file):
+                with open(winners_file, 'r') as f:
+                    for line in f:
+                        dni = line.strip()
+                        if dni:
+                            dnis.append(dni)
+
             winners_payload = "{}|{}|{}".format(
                 WINNERS_MSG_TYPE,
-                len(winners),
-                ",".join(winners),
+                len(dnis),
+                ",".join(dnis),
             )
             write_frame(client_sock, winners_payload.encode("utf-8"))
-            
+
             logging.info(
-                f"action: query_procesada | result: success | cant_ganadores: {len(winners)}"
+                f"action: query_procesada | result: success | cant_ganadores: {len(dnis)}"
             )
         except Exception as e:
             logging.info(f"action: query_procesada | result: fail | error: {e}")
@@ -222,56 +232,51 @@ class Server:
             except OSError:
                 pass
 
-
     def __run_winners_by_agency(self):
         """
-        Computes winners grouped by agency (runs as barrier action).
+        Computes winners grouped by agency and persists them to per-agency files.
+        Runs as barrier action: called exactly once by the last process to reach
+        the barrier, while all others remain blocked.
 
-        Called exactly once by the last process to reach the barrier, while all
-        other processes remain blocked. Populates winners_by_agency before
-        any process is released.
-
-        NOTE: We use a local dict to collect winners and then assign to the
-        shared Manager dict, because nested lists in Manager dicts have
-        synchronization issues when using .append() across processes.
+        Streams load_bets() without materializing it to a list, so memory usage
+        is O(1) regardless of dataset size. Each winner's DNI is written to
+        winners/<agency>.txt as it is found.
         """
-
-        # Aunque la barrera garantiza que solo uno entra acá, el Lock 
-        # explicita la protección del recurso compartido (STORAGE y winners_by_agency)
         with self._bets_lock:
-            local_winners = {}
-            bets = list(load_bets())
-            for bet in bets:
-                if has_won(bet):
-                    agency = str(bet.agency)
-                    if agency not in local_winners:
-                        local_winners[agency] = []
-                    local_winners[agency].append(str(bet.document))
-            
-            for agency, winners_list in local_winners.items():
-                self._winners_by_agency[agency] = winners_list
+            agency_files = {}
+            try:
+                for bet in load_bets():
+                    if has_won(bet):
+                        agency = str(bet.agency)
+                        if agency not in agency_files:
+                            agency_files[agency] = open(
+                                os.path.join(WINNERS_DIR, f"winners_{agency}.txt"), "w"
+                            )
+                        agency_files[agency].write(str(bet.document) + "\n")
+            finally:
+                for f in agency_files.values():
+                    f.close()
 
             logging.info("action: sorteo | result: success")
 
     def __shutdown(self, timeout=10):
         """
-        Graceful shutdown: cierra sockets de clientes, termina procesos hijos, cleanup Manager.
-        
-        El flujo de shutdown es:
-        1. Abortar la barrera para desbloquear procesos esperando en barrier.wait()
-        2. Cerrar sockets de clientes para desbloquear procesos esperando en read_frame()
-        3. Enviar SIGTERM a procesos hijos (via terminate())
-        4. Esperar a que terminen
-        5. NO usamos kill() - si un proceso no responde, lo logueamos pero no forzamos
-        """
+        Graceful shutdown: cierra sockets de clientes, espera hijos, cleanup Manager.
 
-        # 1. Abortamos la barrera para desbloquear procesos hijos que estén esperando en barrier.wait()
+        Flujo:
+        1. Abortar la barrera para desbloquear procesos esperando en barrier.wait()
+        2. Cerrar sockets de clientes → hijos detectan EOF y salen de su loop
+        3. Esperar a los hijos con join(timeout)
+        4. Enviar SIGTERM via terminate() a los que no salieron (último recurso)
+        5. Cleanup de Manager y socket del servidor
+        """
+        # 1. Abortamos la barrera
         try:
             self._barrier.abort()
         except Exception:
             pass
 
-        # 2. Cerramos los sockets de clientes para desbloquear hijos que estén en read_frame()
+        # 2. Cerramos los sockets de clientes para desbloquear hijos en read_frame()
         for client_sock in self._client_sockets:
             try:
                 client_sock.shutdown(socket.SHUT_RDWR)
@@ -280,32 +285,30 @@ class Server:
                 pass
         self._client_sockets.clear()
 
-        # 3. Terminamos todos los procesos hijos (envía SIGTERM)
+        # 3. Esperamos a que los hijos terminen limpiamente (detectaron EOF del socket)
+        for process in self._child_processes:
+            process.join(timeout)
+
+        # 4. Enviamos SIGTERM a los que no salieron como último recurso
         for process in self._child_processes:
             if process.is_alive():
                 process.terminate()
-        
-        # 4. Esperamos a que mueran
-        for process in self._child_processes:
-            process.join(timeout)
-            if process.is_alive():
-                # Si sigue vivo después del timeout, lo logueamos pero NO usamos kill()
-                # El proceso eventualmente morirá cuando el container se detenga
-                logging.warning(f"action: process_termination | result: timeout | pid: {process.pid}")
-        
-        # 5. Limpiamos la lista de procesos
+                process.join(timeout)
+                if process.is_alive():
+                    logging.warning(f"action: process_termination | result: timeout | pid: {process.pid}")
+
         self._child_processes.clear()
-        
-        # 6. Cerramos el socket del server (ya debería estar cerrado por _handle_sigterm)
+
+        # 5. Cerramos el socket del server (ya debería estar cerrado por _handle_sigterm)
         try:
             self._server_socket.close()
         except OSError:
             pass
-        
-        # 7. Shutdown del manager
+
+        # 6. Shutdown del manager
         try:
             self._manager.shutdown()
         except Exception as e:
             logging.warning(f"Manager shutdown error: {e}")
-        
+
         logging.info("action: shutdown | result: success")

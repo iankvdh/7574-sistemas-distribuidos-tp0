@@ -46,7 +46,7 @@ Modificar el servidor para que permita aceptar conexiones y procesar mensajes en
   - Consultar ganadores
 - Cierra conexión al final (`conn.Close()`).
 - **Ventaja**: Eliminamos overhead de repetidas conexiones TCP.
-- **Lectura streaming**: El CSV se lee línea por línea, nunca se carga todo en memoria.
+- **Lectura streaming**: El CSV se lee línea por línea con `csv.Reader` en `sendBatches`, envía el batch y se queda esperando una respuesta antes de leer la próxima línea. 
 
 **Servidor**:
 - Usa `multiprocessing.Process` para que **cada cliente tenga su propio proceso hijo**.
@@ -79,9 +79,10 @@ Si en el futuro el entorno objetivo usa de forma estable Python sin GIL, una sol
 - Handler de SIGTERM cierra el socket del servidor para desbloquear `accept()`
 - En shutdown:
   1. Aborta la barrera (`barrier.abort()`)
-  2. Cierra sockets de clientes (desbloquea `read_frame()` en hijos)
-  3. Envía SIGTERM a hijos via `terminate()` (NO usa `kill()`)
-  4. Espera con timeout
+  2. Cierra sockets de clientes → hijos detectan EOF y salen de su loop limpiamente
+  3. Espera a los hijos con `join(timeout)`
+  4. `terminate()` sobre cualquier hijo que no haya salido (SIGTERM como último recurso, NO usa `kill()`)
+- Los hijos usan `signal.SIG_DFL` para SIGTERM, de modo que `terminate()` del padre sea efectivo si es necesario.
 
 **Cliente**:
 - Goroutine que escucha SIGTERM
@@ -169,15 +170,16 @@ while self._running:
 
 | Variable | Tipo | Propósito |
 |----------|------|---------|
-| `winners_by_agency` | dict | `agency_id → [dni1, dni2, ...]` (cache de resultados) |
-| `bets_lock` | Lock | Protege `store_bets()` |
+| `bets_lock` | Lock | Protege `store_bets()` y la escritura de archivos de ganadores |
 | `barrier` | Barrier(N) | Sincroniza los N workers; su `action` corre el sorteo exactamente una vez |
+
+Los ganadores no se almacenan en un dict compartido en memoria. En cambio, el `action` de la barrera escribe un archivo `winners/winners_{agency}.txt` por agencia (streaming sobre el generador `load_bets()`, sin `list()`). Cuando un hijo recibe QUERY, lee ese archivo. Esto acota el uso de memoria a O(1) durante el sorteo y O(ganadores de esa agencia) durante la consulta, en lugar de O(total de apuestas) o O(total de ganadores de todas las agencias).
 
 
 ### Mecanismos de sincronización en el servidor
 
 - `self._bets_lock` (Manager.Lock)
-  - Protege escrituras concurrentes a `store_bets()`.
+  - Protege escrituras concurrentes a `store_bets()` y la escritura de archivos de ganadores en `__run_winners_by_agency`.
 
 - `self._barrier` (multiprocessing.Barrier(N, action=__run_winners_by_agency))
   - Cada proceso llama `barrier.wait()` al recibir el END de su agencia.
@@ -187,8 +189,9 @@ while self._running:
   - Esto garantiza que ningún proceso responda una QUERY antes de que los resultados estén listos, sin necesidad de locks ni flags adicionales.
   - En shutdown, el padre llama `barrier.abort()` para desbloquear procesos que estén esperando, causando `BrokenBarrierError` que los hijos capturan y manejan.
 
-- `self._winners_by_agency` (Manager.dict)
-  - Poblado dentro del `action` de la barrera usando un dict local para evitar problemas con `append` en listas compartidas de Manager.
+- **Archivos de ganadores por agencia** (`winners/winners_{agency}.txt`)
+  - El `action` de la barrera itera el generador `load_bets()` directamente (sin `list()`) y escribe el DNI de cada ganador en su archivo de agencia correspondiente. Consumo de memoria O(1) durante el sorteo.
+  - Cuando un hijo recibe QUERY, lee el archivo de su agencia. Si no existe, la agencia no tiene ganadores.
 
 - **Cierre de sockets de clientes en shutdown**
   - El padre mantiene lista de sockets de clientes (`self._client_sockets`)

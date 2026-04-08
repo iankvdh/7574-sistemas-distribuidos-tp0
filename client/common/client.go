@@ -1,7 +1,9 @@
 package common
 
 import (
+	"encoding/csv"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -24,19 +26,18 @@ type ClientConfig struct {
 
 // Client Entity that encapsulates how
 type Client struct {
-	config   ClientConfig
-	conn     net.Conn
-	betsChan <-chan BetOrError
+	config     ClientConfig
+	conn       net.Conn
+	agencyFile string
 }
 
 // NewClient Initializes a new client receiving the configuration
-// as a parameter. Recibe un channel de streaming de apuestas.
-func NewClient(config ClientConfig, betsChan <-chan BetOrError) *Client {
-	client := &Client{
-		config:   config,
-		betsChan: betsChan,
+// as a parameter
+func NewClient(config ClientConfig, agencyFile string) *Client {
+	return &Client{
+		config:     config,
+		agencyFile: agencyFile,
 	}
-	return client
 }
 
 // CreateClientSocket Initializes client socket. In case of
@@ -139,38 +140,60 @@ func (c *Client) queryWinners(stop <-chan struct{}) (int, error) {
 	return count, nil
 }
 
+// sendBatches lee el CSV de apuestas de forma streaming (línea por línea) y
+// las envía en batches al servidor usando stop-and-wait.
+// bloqueamos esperando el ACK de cada batch antes de leer el siguiente,
 func (c *Client) sendBatches(stop <-chan struct{}) error {
+	file, err := os.Open(c.agencyFile)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
 
+	reader := csv.NewReader(file)
 	currentBatch := make([]Bet, 0, c.config.BatchMaxAmount)
 	currentBytes := batchHeaderSize
 
-	for betOrErr := range c.betsChan {
+	for {
 		select {
 		case <-stop:
 			return fmt.Errorf("client stopped")
 		default:
 		}
 
-		if betOrErr.Err != nil {
-			return betOrErr.Err
+		row, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if len(row) != 5 {
+			return fmt.Errorf("invalid CSV row with %d columns", len(row))
 		}
 
-		bet := betOrErr.Bet
+		bet := Bet{
+			Agency:    c.config.ID,
+			FirstName: row[0],
+			LastName:  row[1],
+			Document:  row[2],
+			Birthdate: row[3],
+			Number:    row[4],
+		}
+
 		betSize := len(bet.ToRow()) + 1 // +1 para el \n
 
-		// Chequeamos que una apuesta individual (más encabezado) no exceda el MaxPayloadSize bytes
+		// Chequeamos que una apuesta individual (más encabezado) no exceda el MaxPayloadSize
 		if batchHeaderSize+betSize > protocol.MaxPayloadSize {
 			return fmt.Errorf("single bet message size (%d bytes) exceeds limit of %d bytes", batchHeaderSize+betSize, protocol.MaxPayloadSize)
 		}
 
-		// Vemos si agregar esta apuesta excedería los límites
 		wouldExceedSize := currentBytes+betSize > protocol.MaxPayloadSize
 		wouldExceedCount := len(currentBatch)+1 > c.config.BatchMaxAmount
 
 		if wouldExceedSize || wouldExceedCount {
 			if len(currentBatch) > 0 {
-				err := c.sendBatch(currentBatch)
-				if err != nil {
+				if err := c.sendBatch(currentBatch); err != nil {
 					return err
 				}
 			}
@@ -186,8 +209,7 @@ func (c *Client) sendBatches(stop <-chan struct{}) error {
 
 	// Envía el último batch si no está vacío
 	if len(currentBatch) > 0 {
-		err := c.sendBatch(currentBatch)
-		if err != nil {
+		if err := c.sendBatch(currentBatch); err != nil {
 			return err
 		}
 	}

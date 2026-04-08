@@ -127,14 +127,8 @@ func main() {
 	}
 
 	agencyFile := resolveAgencyFile(v)
-	betsChan, err := common.LoadBetsFromCSVStreaming(agencyFile, clientConfig.ID)
-	if err != nil {
-		log.Criticalf("action: load_bets | result: fail | client_id: %s | error: %v", clientConfig.ID, err)
-		return
-	}
-
 	log.Infof("action: load_bets | result: success | client_id: %s | file: %s", clientConfig.ID, agencyFile)
 
-	client := common.NewClient(clientConfig, betsChan)
+	client := common.NewClient(clientConfig, agencyFile)
 	client.StartClient()
 }
