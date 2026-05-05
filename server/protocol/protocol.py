@@ -3,6 +3,10 @@ ACK_FAIL = b"ACK|FAIL"
 ACK_WAIT = b"ACK|WAIT"
 MAX_PAYLOAD_SIZE = 8192
 
+def set_max_payload_size(size):
+    global MAX_PAYLOAD_SIZE
+    MAX_PAYLOAD_SIZE = size
+
 # read_exact lee exactamente 'size' bytes del socket.
 # Si la conexión se cierra antes de completar la lectura, tira un error.
 def read_exact(sock, size):

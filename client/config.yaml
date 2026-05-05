@@ -4,5 +4,7 @@ log:
   level: "INFO"
 batch:
   maxAmount: 80
+protocol:
+  maxPayloadSize: 8192
 agency:
   file: "/data/agency.csv"
